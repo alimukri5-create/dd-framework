@@ -1,4 +1,4 @@
-"""DD Framework - Institutional Due Diligence Streamlit app."""
+﻿"""DD Framework - Institutional Due Diligence Streamlit app."""
 
 from __future__ import annotations
 
@@ -20,18 +20,20 @@ APP_TITLE = "DD Framework - Institutional Due Diligence"
 DEFAULT_MODEL = "gpt-4-turbo"
 DEFAULT_TIMEOUT_SECONDS = 180
 SCORE_NAMES = [
-    "Moat Score",
-    "Adoption Clarity",
-    "Competitive Position",
-    "Thesis Strength",
+    "Setup Quality",
+    "Catalyst Clarity",
+    "Risk/Reward",
+    "Decision Confidence",
 ]
 
 SYSTEM_PROMPT = """
-You are an institutional equity research analyst preparing an investment committee due diligence memo.
-Be evidence-led, balanced, and explicit about uncertainty. Cite sources wherever available, never invent
-precise figures, and flag missing or stale data. Use confidence scores from 1-10 for material claims.
-At the end of every answer, include a compact section named DD_FRAMEWORK_SIGNAL with any relevant
-scores, probabilities, or recommendation evidence that can support a downstream dashboard.
+You are an institutional trading analyst producing fast decision support, not a generic company profile.
+Prioritize what moves the stock, what matters now, what would change the view, and whether the setup is
+actionable. Be concise, evidence-led, and explicit about uncertainty. Cite sources wherever available, never
+invent precise figures, and flag missing or stale data. Avoid narrative filler.
+
+At the end of every answer, include a compact section named DD_FRAMEWORK_SIGNAL with scores,
+probabilities, catalysts, invalidation levels, or recommendation evidence that can support a dashboard.
 """.strip()
 
 
@@ -47,6 +49,7 @@ class DDResult:
     dashboard_scores: dict[str, int]
     recommendation: str
     recommendation_reason: str
+    decision_card: dict[str, str]
 
 
 class UserFacingError(Exception):
@@ -156,6 +159,10 @@ def load_cache(ticker: str) -> DDResult | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        if "decision_card" not in data:
+            recommendation = data.get("recommendation", "HOLD")
+            reason = data.get("recommendation_reason", "Legacy cached result.")
+            data["decision_card"] = extract_decision_card(data.get("step_3", ""), recommendation, reason)
         return DDResult(**data)
     except (json.JSONDecodeError, TypeError, OSError):
         return None
@@ -186,8 +193,8 @@ def call_openai(client: OpenAI, prompt: str, model: str, *, step_name: str) -> s
         )
         text = getattr(response, "output_text", None)
         if text:
-            return text.strip()
-        return extract_responses_text(response).strip()
+            return clean_model_text(text)
+        return clean_model_text(extract_responses_text(response))
     except AttributeError:
         return call_openai_chat_completion(client, prompt, model)
     except RateLimitError as exc:
@@ -213,7 +220,33 @@ def call_openai_chat_completion(client: OpenAI, prompt: str, model: str) -> str:
         ],
         max_tokens=2600,
     )
-    return completion.choices[0].message.content.strip()
+    return clean_model_text(completion.choices[0].message.content)
+
+
+def clean_model_text(text: str | None) -> str:
+    """Repair common mojibake sequences that can appear in exported model text."""
+    if not text:
+        return ""
+    replacements = {
+        "\u00e2\u20ac\u2122": "'",
+        "\u00e2\u20ac\u02dc": "'",
+        "\u00e2\u20ac\u0153": '"',
+        "\u00e2\u20ac\ufffd": '"',
+        "\u00e2\u20ac\u009d": '"',
+        "\u00e2\u20ac\u201c": "-",
+        "\u00e2\u20ac\u201d": "-",
+        "\u00e2\u20ac\u00a6": "...",
+        "\u00e2\u201a\u00ac": "EUR",
+        "\u00c2\u00a3": "GBP",
+        "\u00c2\u00a5": "JPY",
+        "\u00c2\u00ae": "(R)",
+        "\u00c2\u00a9": "(C)",
+        "\u00c2": "",
+    }
+    cleaned = text
+    for broken, fixed in replacements.items():
+        cleaned = cleaned.replace(broken, fixed)
+    return cleaned.strip()
 
 
 def extract_responses_text(response: Any) -> str:
@@ -228,23 +261,34 @@ def extract_responses_text(response: Any) -> str:
 
 def build_step_1_prompt(ticker: str) -> str:
     return f"""
-You are an institutional equity research analyst. Research {ticker}:
-1. BUSINESS MODEL: Products, revenue breakdown (%), installed base, ASP, pre/early/profitable?
-2. MOAT: Primary advantage? Durability (1-10)? Why?
-3. KEY METRICS: Q revenue ($M), YoY growth (%), Top 3 competitors
-4. CONFIDENCE: Rate each answer (1-10). Missing data?
-Format: 800 words, cite sources.
+Research {ticker} for a fast trading decision.
+
+Return a concise decision briefing, not a company story:
+1. WHAT MOVES THE STOCK: top 3 drivers in the next 1-90 days.
+2. CURRENT SETUP: recent revenue/growth/profitability, valuation context, liquidity/volatility if known.
+3. BUSINESS ONLY IF TRADE-RELEVANT: revenue mix, installed base/contract model, recurring vs one-time revenue.
+4. COMPETITION: top 3 competitors and the one competitive fact most likely to matter to the stock.
+5. SOURCE QUALITY: cite sources where available; list missing data that would change the decision.
+6. CONFIDENCE: score each section 1-10.
+
+Format: 350-500 words. Use bullets. No background filler.
 """.strip()
 
 
 def build_step_2_prompt(step_1: str) -> str:
     return f"""
 Based on Step 1: {step_1}
-1. HOSPITAL ECONOMICS: Replacement cycle (yrs)? Switching cost ($M + months)? Payback period (months)?
-2. REIMBURSEMENT: CPT code? Rate per procedure? 5yr trend? Surgeon margin? Adoption threshold?
-3. GROWTH: What drives it? What stalls it? Current adoption rate (%)?
-4. UNIT ECONOMICS: Equipment margin (%), consumables margin (%), payback via recurring ($)?
-Format: 900 words, show confidence.
+
+Convert the company facts into investable/tradable economics:
+1. ECONOMIC ENGINE: what KPI actually drives the stock for this sector? Examples: orders/bookings, ARPU,
+   churn, gross margin, utilization, commodity price, reimbursement, deliveries, backlog, licensing, FCF.
+2. CUSTOMER/UNIT ECONOMICS: switching cost, replacement/upgrade cycle, payback, recurring revenue,
+   margin structure, or sector-equivalent economics. If hospital/reimbursement is irrelevant, say N/A.
+3. CATALYST MAP: next 3 likely catalysts, expected timing, and whether each is bullish/bearish/ambiguous.
+4. STALL MAP: what would make the thesis fail fast?
+5. FAST CHECK: what single data point should a trader verify before acting?
+
+Format: 350-500 words. Use bullets/table style. Show confidence. No repeated company overview.
 """.strip()
 
 
@@ -253,11 +297,29 @@ def build_step_3_prompt(step_1: str, step_2: str) -> str:
 Based on Steps 1-2: {step_1}
 
 {step_2}
-1. BULL (3yrs): 3 advantages, inflection timeline, what goes RIGHT, probability (%)
-2. BEAR: 3 threats, incumbent response, stall timeline, probability (%)
-3. ASSESSMENT: Which likely? Market pricing in vs. missing? Asymmetry?
-4. MOAT: 3yr strength (1-10), 5yr strength (1-10)
-Format: 1000 words, balanced evidence.
+
+Produce a decision-first trading dashboard:
+1. DECISION: PROCEED / HOLD / AVOID. Also give bias: LONG / WATCHLIST / AVOID.
+2. WHY NOW: one sentence. If no near-term edge, say so.
+3. BULL CASE: 3 drivers, what goes right, probability (%), trigger to confirm.
+4. BEAR CASE: 3 risks, what breaks, probability (%), trigger to invalidate.
+5. ASYMMETRY: upside/downside balance, what the market may be pricing in vs missing.
+6. TRADE CARD: horizon, top catalyst, invalidation trigger, key metric to monitor, confidence 1-10.
+
+End with this exact block:
+TRADING_DECISION_CARD
+Action: PROCEED/HOLD/AVOID
+Bias: LONG/WATCHLIST/AVOID
+Horizon: [timeframe]
+Why Now: [one sentence]
+Top Catalyst: [one sentence]
+Invalidation: [one sentence]
+Key Metric: [one sentence]
+Bull Probability: [%]
+Bear Probability: [%]
+Confidence: [1-10]
+
+Format: 450-650 words. No generic background.
 """.strip()
 
 
@@ -290,6 +352,7 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
 
     scores = extract_dashboard_scores(step_1, step_2, step_3)
     recommendation, reason = build_recommendation(scores, step_3)
+    decision_card = extract_decision_card(step_3, recommendation, reason)
     result = DDResult(
         ticker=ticker,
         company_name=extract_company_name(step_1),
@@ -301,6 +364,7 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         dashboard_scores=scores,
         recommendation=recommendation,
         recommendation_reason=reason,
+        decision_card=decision_card,
     )
     save_cache(result)
     return result
@@ -321,14 +385,14 @@ def extract_company_name(step_1: str) -> str | None:
 def extract_dashboard_scores(step_1: str, step_2: str, step_3: str) -> dict[str, int]:
     combined = "\n".join([step_1, step_2, step_3])
     scores = {
-        "Moat Score": find_score(
+        "Setup Quality": score_setup_quality(combined),
+        "Catalyst Clarity": score_catalyst_clarity(combined),
+        "Risk/Reward": score_risk_reward(combined, step_3),
+        "Decision Confidence": find_score(
             combined,
-            [r"moat(?:\s+score|\s+strength|\s+durability)?\D{0,40}(\d{1,2})\s*/\s*10"],
+            [r"confidence\D{0,40}(\d{1,2})\s*/?\s*10", r"confidence\D{0,40}(\d{1,2})\b"],
             default=6,
         ),
-        "Adoption Clarity": score_adoption_clarity(combined),
-        "Competitive Position": score_competitive_position(combined),
-        "Thesis Strength": score_thesis_strength(combined),
     }
     return {name: clamp_score(score) for name, score in scores.items()}
 
@@ -341,52 +405,99 @@ def find_score(text: str, patterns: list[str], default: int) -> int:
     return default
 
 
-def score_adoption_clarity(text: str) -> int:
+def score_setup_quality(text: str) -> int:
     score = 6
-    positive_terms = ["adoption rate", "installed base", "replacement cycle", "payback", "cpt", "reimbursement"]
+    positive_terms = ["setup", "valuation", "liquidity", "volatility", "growth", "margin", "revenue", "profitability"]
     uncertainty_terms = ["unknown", "not disclosed", "insufficient", "missing", "limited data"]
     score += min(2, sum(1 for term in positive_terms if term in text.lower()) // 2)
     score -= min(3, sum(1 for term in uncertainty_terms if term in text.lower()))
     return clamp_score(score)
 
 
-def score_competitive_position(text: str) -> int:
+def score_catalyst_clarity(text: str) -> int:
     score = 6
     lower = text.lower()
-    positives = ["differentiated", "leading", "proprietary", "regulatory", "installed base", "recurring"]
-    negatives = ["incumbent", "commodity", "low switching", "price pressure", "crowded", "competition"]
-    score += min(3, sum(1 for term in positives if term in lower))
-    score -= min(3, sum(1 for term in negatives if term in lower) // 2)
+    positives = ["catalyst", "timing", "earnings", "guidance", "approval", "orders", "backlog", "launch"]
+    negatives = ["no near-term", "unclear", "not enough", "missing", "stale"]
+    score += min(3, sum(1 for term in positives if term in lower) // 2)
+    score -= min(3, sum(1 for term in negatives if term in lower))
     return clamp_score(score)
 
 
-def score_thesis_strength(text: str) -> int:
+def score_risk_reward(text: str, step_3: str) -> int:
     bull = extract_probability(text, "bull")
     bear = extract_probability(text, "bear")
-    moat = find_score(text, [r"3yr\s+strength\D{0,30}(\d{1,2})\s*/\s*10"], default=6)
+    base = find_score(step_3, [r"risk/reward\D{0,40}(\d{1,2})\s*/?\s*10"], default=6)
     if bull is None or bear is None:
-        return moat
+        return base
     spread = bull - bear
     if spread >= 25:
-        return clamp_score(moat + 2)
+        return clamp_score(base + 2)
     if spread >= 10:
-        return clamp_score(moat + 1)
+        return clamp_score(base + 1)
     if spread <= -20:
-        return clamp_score(moat - 3)
+        return clamp_score(base - 3)
     if spread <= -5:
-        return clamp_score(moat - 1)
-    return moat
+        return clamp_score(base - 1)
+    return base
+
+
+def extract_decision_card(step_3: str, recommendation: str, reason: str) -> dict[str, str]:
+    return {
+        "Action": extract_card_field(step_3, "Action") or recommendation,
+        "Bias": extract_card_field(step_3, "Bias") or bias_from_recommendation(recommendation),
+        "Horizon": extract_card_field(step_3, "Horizon") or "Not specified",
+        "Why Now": extract_card_field(step_3, "Why Now") or reason,
+        "Top Catalyst": extract_card_field(step_3, "Top Catalyst") or "Not specified",
+        "Invalidation": extract_card_field(step_3, "Invalidation") or "Not specified",
+        "Key Metric": extract_card_field(step_3, "Key Metric") or "Not specified",
+        "Bull Probability": extract_card_field(step_3, "Bull Probability") or format_probability(extract_probability(step_3, "bull")),
+        "Bear Probability": extract_card_field(step_3, "Bear Probability") or format_probability(extract_probability(step_3, "bear")),
+        "Confidence": extract_card_field(step_3, "Confidence") or "Not specified",
+    }
+
+
+def extract_card_field(text: str, field: str) -> str | None:
+    match = re.search(rf"^\s*{re.escape(field)}\s*:\s*(.+?)\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def bias_from_recommendation(recommendation: str) -> str:
+    if recommendation == "PROCEED":
+        return "LONG"
+    if recommendation == "AVOID":
+        return "AVOID"
+    return "WATCHLIST"
+
+
+def format_probability(value: int | None) -> str:
+    return f"{value}%" if value is not None else "Not specified"
 
 
 def extract_probability(text: str, label: str) -> int | None:
-    pattern = rf"{label}\D{{0,120}}(?:probability|prob\.)\D{{0,20}}(\d{{1,3}})\s*%"
-    match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+    section = extract_labeled_section(text, label)
+    if not section:
+        return None
+    match = re.search(r"(?:probability|prob\.)\D{0,60}(\d{1,3})\s*%", section, flags=re.IGNORECASE)
     if not match:
-        pattern = rf"{label}\D{{0,80}}(\d{{1,3}})\s*%"
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        match = re.search(r"(\d{1,3})\s*%", section)
     if not match:
         return None
     return max(0, min(100, int(match.group(1))))
+
+
+def extract_labeled_section(text: str, label: str) -> str | None:
+    label_match = re.search(rf"\b{label}\b", text, flags=re.IGNORECASE)
+    if not label_match:
+        return None
+    section = text[label_match.start() :]
+    opposite = "bear" if label.lower() == "bull" else "bull"
+    next_match = re.search(rf"\n\s*(?:#+\s*)?\**{opposite}\b", section[1:], flags=re.IGNORECASE)
+    if next_match:
+        section = section[: next_match.start() + 1]
+    return section
 
 
 def clamp_score(value: int) -> int:
@@ -418,6 +529,7 @@ def export_json(result: DDResult) -> str:
 
 def export_markdown(result: DDResult) -> str:
     scores = "\n".join(f"- **{name}:** {score}/10" for name, score in result.dashboard_scores.items())
+    decision = "\n".join(f"- **{name}:** {value}" for name, value in result.decision_card.items())
     company = f"\n**Company:** {result.company_name}" if result.company_name else ""
     return f"""# {APP_TITLE}
 
@@ -430,6 +542,10 @@ def export_markdown(result: DDResult) -> str:
 ## Dashboard
 
 {scores}
+
+## Decision Card
+
+{decision}
 
 ## Step 1 - Business, Moat, Metrics
 
@@ -446,7 +562,25 @@ def export_markdown(result: DDResult) -> str:
 
 
 def render_dashboard(result: DDResult) -> None:
-    st.subheader("Dashboard")
+    st.subheader("Decision Card")
+    card = result.decision_card
+    top_cols = st.columns([1, 1, 2, 2])
+    top_cols[0].metric("Action", card.get("Action", result.recommendation))
+    top_cols[1].metric("Bias", card.get("Bias", "WATCHLIST"))
+    top_cols[2].metric("Horizon", card.get("Horizon", "Not specified"))
+    top_cols[3].metric("Confidence", card.get("Confidence", "Not specified"))
+
+    with st.container(border=True):
+        st.markdown(f"**Why now:** {card.get('Why Now', result.recommendation_reason)}")
+        st.markdown(f"**Top catalyst:** {card.get('Top Catalyst', 'Not specified')}")
+        st.markdown(f"**Invalidation:** {card.get('Invalidation', 'Not specified')}")
+        st.markdown(f"**Key metric:** {card.get('Key Metric', 'Not specified')}")
+        st.markdown(
+            f"**Bull/Bear probability:** {card.get('Bull Probability', 'Not specified')} / "
+            f"{card.get('Bear Probability', 'Not specified')}"
+        )
+
+    st.subheader("Setup Scores")
     cols = st.columns(4)
     for col, name in zip(cols, SCORE_NAMES):
         col.metric(name, f"{result.dashboard_scores.get(name, 0)}/10")
@@ -461,8 +595,7 @@ def render_dashboard(result: DDResult) -> None:
 
 
 def render_step(title: str, content: str) -> None:
-    with st.container(border=True):
-        st.markdown(f"### {title}")
+    with st.expander(title, expanded=False):
         st.markdown(content)
 
 
@@ -529,7 +662,7 @@ def render_cached_notice(result: DDResult) -> None:
 def main() -> None:
     configure_page()
     st.title(APP_TITLE)
-    st.caption("Three-step institutional equity research workflow with cached ticker memos and exportable outputs.")
+    st.caption("Ticker-in, decision-first trading insight: catalyst, invalidation, risk/reward, confidence, exports.")
 
     with st.sidebar:
         st.header("Analysis Setup")
@@ -542,7 +675,7 @@ def main() -> None:
         st.markdown(
             """
             <div class="dd-shell">
-            Enter a ticker, then run the workflow. Cached analyses return instantly unless refresh is enabled.
+            Enter a ticker to generate a concise decision card. Cached analyses return instantly unless refresh is enabled.
             </div>
             """,
             unsafe_allow_html=True,
