@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import re
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 import streamlit as st
 import streamlit.components.v1 as components
+import yfinance as yf
 from openai import APIConnectionError, APIError, APITimeoutError, AuthenticationError, OpenAI, RateLimitError
 
 
@@ -140,6 +142,127 @@ def get_model() -> str:
     return str(get_secret("OPENAI_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
 
 
+def fetch_market_data(ticker: str) -> dict[str, Any]:
+    """Fetch a compact market data pack to ground the model before analysis."""
+    data: dict[str, Any] = {
+        "ticker": ticker,
+        "source": "Yahoo Finance via yfinance",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        yf_cache_dir = Path(tempfile.gettempdir()) / "dd-framework-yfinance-cache"
+        yf_cache_dir.mkdir(parents=True, exist_ok=True)
+        yf.set_tz_cache_location(str(yf_cache_dir))
+        asset = yf.Ticker(ticker)
+        info = asset.get_info() or {}
+        history = asset.history(period="6mo", interval="1d", auto_adjust=True)
+    except Exception as exc:
+        data["error"] = f"Market data fetch failed: {exc}"
+        return data
+
+    data.update(
+        {
+            "name": info.get("shortName") or info.get("longName"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            "market_cap": info.get("marketCap"),
+            "enterprise_value": info.get("enterpriseValue"),
+            "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
+            "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
+            "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
+            "average_volume": info.get("averageVolume"),
+            "float_shares": info.get("floatShares"),
+            "short_percent_float": info.get("shortPercentOfFloat"),
+            "total_revenue": info.get("totalRevenue"),
+            "revenue_growth": info.get("revenueGrowth"),
+            "gross_margins": info.get("grossMargins"),
+            "operating_margins": info.get("operatingMargins"),
+            "profit_margins": info.get("profitMargins"),
+            "ebitda_margins": info.get("ebitdaMargins"),
+            "price_to_sales": info.get("priceToSalesTrailing12Months"),
+            "trailing_pe": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "beta": info.get("beta"),
+        }
+    )
+
+    if not history.empty and "Close" in history:
+        close = history["Close"].dropna()
+        volume = history["Volume"].dropna() if "Volume" in history else None
+        data.update(
+            {
+                "last_close": float(close.iloc[-1]) if len(close) else None,
+                "return_5d": pct_return(close, 5),
+                "return_1m": pct_return(close, 21),
+                "return_3m": pct_return(close, 63),
+                "return_6m": pct_return(close, 126),
+                "avg_volume_20d": float(volume.tail(20).mean()) if volume is not None and len(volume) else None,
+            }
+        )
+    return data
+
+
+def pct_return(close: Any, periods: int) -> float | None:
+    if len(close) <= periods:
+        return None
+    start = float(close.iloc[-periods - 1])
+    end = float(close.iloc[-1])
+    if start == 0:
+        return None
+    return (end / start - 1) * 100
+
+
+def format_market_data(data: dict[str, Any]) -> str:
+    if data.get("error"):
+        return f"MARKET DATA SOURCE: {data['source']}\nFETCH STATUS: {data['error']}"
+    labels = {
+        "name": "Company",
+        "sector": "Sector",
+        "industry": "Industry",
+        "market_cap": "Market Cap",
+        "enterprise_value": "Enterprise Value",
+        "current_price": "Current Price",
+        "last_close": "Last Close",
+        "fifty_two_week_high": "52W High",
+        "fifty_two_week_low": "52W Low",
+        "return_5d": "5D Return %",
+        "return_1m": "1M Return %",
+        "return_3m": "3M Return %",
+        "return_6m": "6M Return %",
+        "average_volume": "Average Volume",
+        "avg_volume_20d": "20D Avg Volume",
+        "float_shares": "Float Shares",
+        "short_percent_float": "Short % Float",
+        "total_revenue": "Total Revenue",
+        "revenue_growth": "Revenue Growth",
+        "gross_margins": "Gross Margin",
+        "operating_margins": "Operating Margin",
+        "profit_margins": "Profit Margin",
+        "ebitda_margins": "EBITDA Margin",
+        "price_to_sales": "Price/Sales",
+        "trailing_pe": "Trailing P/E",
+        "forward_pe": "Forward P/E",
+        "beta": "Beta",
+    }
+    lines = [
+        f"MARKET DATA SOURCE: {data.get('source')}",
+        f"FETCHED AT: {data.get('fetched_at')}",
+    ]
+    for key, label in labels.items():
+        value = data.get(key)
+        if value is not None:
+            lines.append(f"{label}: {format_market_value(value)}")
+    return "\n".join(lines)
+
+
+def format_market_value(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:,.2f}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return str(value)
+
+
 def get_cache_dir() -> Path:
     configured = str(get_secret("CACHE_DIR", "cache")).strip() or "cache"
     cache_dir = Path(configured)
@@ -259,16 +382,21 @@ def extract_responses_text(response: Any) -> str:
     return "\n".join(chunks)
 
 
-def build_step_1_prompt(ticker: str) -> str:
+def build_step_1_prompt(ticker: str, market_data: str) -> str:
     return f"""
 Research {ticker} for a fast trading decision.
+
+Use this market data pack as your factual starting point. If a value is missing, say it is missing.
+Do not replace missing values with generic guesses.
+
+{market_data}
 
 Return a concise decision briefing, not a company story:
 1. WHAT MOVES THE STOCK: top 3 drivers in the next 1-90 days.
 2. CURRENT SETUP: recent revenue/growth/profitability, valuation context, liquidity/volatility if known.
 3. BUSINESS ONLY IF TRADE-RELEVANT: revenue mix, installed base/contract model, recurring vs one-time revenue.
 4. COMPETITION: top 3 competitors and the one competitive fact most likely to matter to the stock.
-5. SOURCE QUALITY: cite sources where available; list missing data that would change the decision.
+5. SOURCE QUALITY: cite the market data source above and list missing data that would change the decision.
 6. CONFIDENCE: score each section 1-10.
 
 Format: 350-500 words. Use bullets. No background filler.
@@ -330,6 +458,12 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
 
     client = get_openai_client()
     model = get_model()
+    market_data = fetch_market_data(ticker)
+    market_data_text = format_market_data(market_data)
+    if market_data.get("error"):
+        st.warning(market_data["error"])
+    else:
+        st.success(f"Loaded market data from {market_data['source']}.")
 
     step_1_box = st.empty()
     step_2_box = st.empty()
@@ -337,7 +471,7 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
 
     with step_1_box.container():
         with st.spinner("Step 1: researching business model, moat, metrics, and confidence..."):
-            step_1 = call_openai(client, build_step_1_prompt(ticker), model, step_name="Step 1")
+            step_1 = call_openai(client, build_step_1_prompt(ticker, market_data_text), model, step_name="Step 1")
         render_step("Step 1 - Business, Moat, Metrics", step_1)
 
     with step_2_box.container():
