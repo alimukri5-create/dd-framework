@@ -53,6 +53,7 @@ class DDResult:
     recommendation: str
     recommendation_reason: str
     decision_card: dict[str, str]
+    market_snapshot: dict[str, str]
 
 
 class UserFacingError(Exception):
@@ -270,6 +271,57 @@ def format_market_data(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_market_snapshot(data: dict[str, Any]) -> dict[str, str]:
+    if data.get("error"):
+        return {"Data": data["error"]}
+
+    snapshot: dict[str, str] = {}
+    snapshot["Price"] = format_market_value(data.get("current_price") or data.get("last_close") or "N/A")
+    snapshot["1M / 3M"] = (
+        f"{format_percent(data.get('return_1m'))} / {format_percent(data.get('return_3m'))}"
+    )
+    snapshot["Valuation"] = f"P/S {format_market_value(data.get('price_to_sales') or 'N/A')}"
+    snapshot["Margins"] = (
+        f"Gross {format_percent_ratio(data.get('gross_margins'))}, "
+        f"Op {format_percent_ratio(data.get('operating_margins'))}, "
+        f"Net {format_percent_ratio(data.get('profit_margins'))}"
+    )
+    snapshot["Volatility"] = f"Beta {format_market_value(data.get('beta') or 'N/A')}"
+    snapshot["Quick Read"] = build_quick_read(data)
+    return snapshot
+
+
+def build_quick_read(data: dict[str, Any]) -> str:
+    flags: list[str] = []
+    if number_or_none(data.get("return_1m")) and number_or_none(data.get("return_1m")) >= 50:
+        flags.append("extended 1M move")
+    if number_or_none(data.get("return_3m")) and number_or_none(data.get("return_3m")) >= 100:
+        flags.append("major 3M momentum")
+    if number_or_none(data.get("price_to_sales")) and number_or_none(data.get("price_to_sales")) >= 10:
+        flags.append("premium sales multiple")
+    if number_or_none(data.get("operating_margins")) and number_or_none(data.get("operating_margins")) < 0:
+        flags.append("operating losses")
+    if number_or_none(data.get("beta")) and number_or_none(data.get("beta")) >= 2:
+        flags.append("high beta")
+    if not flags:
+        return "No obvious market-data red flags from the available snapshot."
+    return ", ".join(flags)
+
+
+def format_percent(value: Any) -> str:
+    parsed = number_or_none(value)
+    return "N/A" if parsed is None else f"{parsed:,.1f}%"
+
+
+def format_percent_ratio(value: Any) -> str:
+    parsed = number_or_none(value)
+    return "N/A" if parsed is None else f"{parsed * 100:,.1f}%"
+
+
+def number_or_none(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def format_market_value(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:,.2f}"
@@ -301,6 +353,8 @@ def load_cache(ticker: str) -> DDResult | None:
             recommendation = data.get("recommendation", "HOLD")
             reason = data.get("recommendation_reason", "Legacy cached result.")
             data["decision_card"] = extract_decision_card(data.get("step_3", ""), recommendation, reason)
+        if "market_snapshot" not in data:
+            data["market_snapshot"] = {}
         return DDResult(**data)
     except (json.JSONDecodeError, TypeError, OSError):
         return None
@@ -411,6 +465,8 @@ Return a concise decision briefing, not a company story:
 2. CURRENT SETUP: recent revenue/growth/profitability, valuation context, liquidity/volatility if known.
 3. BUSINESS ONLY IF TRADE-RELEVANT: revenue mix, installed base/contract model, recurring vs one-time revenue.
 4. COMPETITION: top 3 competitors and the one competitive fact most likely to matter to the stock.
+   Do not list acquired, merged, delisted, or former companies as current competitors. If current competitor
+   status is uncertain, say "competitor list needs verification" instead of guessing.
 5. SOURCE QUALITY: cite the market data source above and list missing data that would change the decision.
 6. CONFIDENCE: score each section 1-10.
 
@@ -475,6 +531,7 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     model = get_model()
     market_data = fetch_market_data(ticker)
     market_data_text = format_market_data(market_data)
+    market_snapshot = build_market_snapshot(market_data)
     if market_data.get("error"):
         st.warning(market_data["error"])
     else:
@@ -514,6 +571,7 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         recommendation=recommendation,
         recommendation_reason=reason,
         decision_card=decision_card,
+        market_snapshot=market_snapshot,
     )
     save_cache(result)
     return result
@@ -679,6 +737,7 @@ def export_json(result: DDResult) -> str:
 def export_markdown(result: DDResult) -> str:
     scores = "\n".join(f"- **{name}:** {score}/10" for name, score in result.dashboard_scores.items())
     decision = "\n".join(f"- **{name}:** {value}" for name, value in result.decision_card.items())
+    market = "\n".join(f"- **{name}:** {value}" for name, value in result.market_snapshot.items())
     company = f"\n**Company:** {result.company_name}" if result.company_name else ""
     return f"""# {APP_TITLE}
 
@@ -691,6 +750,10 @@ def export_markdown(result: DDResult) -> str:
 ## Dashboard
 
 {scores}
+
+## Market Snapshot
+
+{market}
 
 ## Decision Card
 
@@ -711,6 +774,12 @@ def export_markdown(result: DDResult) -> str:
 
 
 def render_dashboard(result: DDResult) -> None:
+    if result.market_snapshot:
+        st.subheader("Market Snapshot")
+        snap_cols = st.columns(min(4, max(1, len(result.market_snapshot))))
+        for index, (label, value) in enumerate(result.market_snapshot.items()):
+            snap_cols[index % len(snap_cols)].metric(label, value)
+
     st.subheader("Decision Card")
     card = result.decision_card
     top_cols = st.columns([1, 1, 2, 2])
