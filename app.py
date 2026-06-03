@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import tempfile
 from dataclasses import asdict, dataclass
@@ -150,6 +151,7 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
+        clear_proxy_env_for_market_data()
         yf_cache_dir = Path(tempfile.gettempdir()) / "dd-framework-yfinance-cache"
         yf_cache_dir.mkdir(parents=True, exist_ok=True)
         yf.set_tz_cache_location(str(yf_cache_dir))
@@ -200,6 +202,19 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
             }
         )
     return data
+
+
+def clear_proxy_env_for_market_data() -> None:
+    """Avoid inherited local-blocking proxy settings when fetching public market data."""
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]:
+        os.environ.pop(name, None)
 
 
 def pct_return(close: Any, periods: int) -> float | None:
