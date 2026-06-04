@@ -184,8 +184,10 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
     data.update(
         {
             "name": info.get("shortName") or info.get("longName"),
+            "business_summary": info.get("longBusinessSummary"),
             "sector": info.get("sector"),
             "industry": info.get("industry"),
+            "website": info.get("website"),
             "market_cap": info.get("marketCap"),
             "enterprise_value": info.get("enterpriseValue"),
             "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
@@ -195,6 +197,13 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
             "float_shares": info.get("floatShares"),
             "short_percent_float": info.get("shortPercentOfFloat"),
             "total_revenue": info.get("totalRevenue"),
+            "total_cash": info.get("totalCash"),
+            "total_debt": info.get("totalDebt"),
+            "operating_cashflow": info.get("operatingCashflow"),
+            "free_cashflow": info.get("freeCashflow"),
+            "shares_outstanding": info.get("sharesOutstanding"),
+            "implied_shares_outstanding": info.get("impliedSharesOutstanding"),
+            "book_value": info.get("bookValue"),
             "revenue_growth": info.get("revenueGrowth"),
             "gross_margins": info.get("grossMargins"),
             "operating_margins": info.get("operatingMargins"),
@@ -310,8 +319,10 @@ def format_market_data(data: dict[str, Any]) -> str:
         return f"MARKET DATA SOURCE: {data['source']}\nFETCH STATUS: {data['error']}"
     labels = {
         "name": "Company",
+        "business_summary": "Business Summary",
         "sector": "Sector",
         "industry": "Industry",
+        "website": "Website",
         "market_cap": "Market Cap",
         "enterprise_value": "Enterprise Value",
         "current_price": "Current Price",
@@ -327,6 +338,13 @@ def format_market_data(data: dict[str, Any]) -> str:
         "float_shares": "Float Shares",
         "short_percent_float": "Short % Float",
         "total_revenue": "Total Revenue",
+        "total_cash": "Total Cash",
+        "total_debt": "Total Debt",
+        "operating_cashflow": "Operating Cash Flow",
+        "free_cashflow": "Free Cash Flow",
+        "shares_outstanding": "Shares Outstanding",
+        "implied_shares_outstanding": "Implied Shares Outstanding",
+        "book_value": "Book Value",
         "revenue_growth": "Revenue Growth",
         "gross_margins": "Gross Margin",
         "operating_margins": "Operating Margin",
@@ -369,6 +387,11 @@ def build_market_snapshot(data: dict[str, Any]) -> dict[str, str]:
         f"Op {format_percent_ratio(data.get('operating_margins'))}, "
         f"Net {format_percent_ratio(data.get('profit_margins'))}"
     )
+    snapshot["Cash / Debt"] = (
+        f"{format_market_value(data.get('total_cash') or 'N/A')} / "
+        f"{format_market_value(data.get('total_debt') or 'N/A')}"
+    )
+    snapshot["FCF"] = format_market_value(data.get("free_cashflow") or "N/A")
     snapshot["Volatility"] = f"Beta {format_market_value(data.get('beta') or 'N/A')}"
     snapshot["Quick Read"] = build_quick_read(data)
     return snapshot
@@ -503,14 +526,28 @@ def score_catalyst_proximity(data: dict[str, Any]) -> int:
 
 def score_dilution_risk(data: dict[str, Any]) -> int:
     score = 3
-    if number_or_none(data.get("operating_margins")) and number_or_none(data.get("operating_margins")) < -0.2:
+    op_margin = number_or_none(data.get("operating_margins"))
+    profit_margin = number_or_none(data.get("profit_margins"))
+    ps = number_or_none(data.get("price_to_sales"))
+    r3 = number_or_none(data.get("return_3m"))
+    cash = number_or_none(data.get("total_cash"))
+    fcf = number_or_none(data.get("free_cashflow"))
+    annual_burn = abs(fcf) if fcf is not None and fcf < 0 else None
+
+    if op_margin is not None and op_margin < -0.2:
         score += 2
-    if number_or_none(data.get("profit_margins")) and number_or_none(data.get("profit_margins")) < -0.2:
+    if profit_margin is not None and profit_margin < -0.2:
         score += 1
-    if number_or_none(data.get("price_to_sales")) and number_or_none(data.get("price_to_sales")) > 10:
+    if ps is not None and ps > 10:
         score += 1
-    if number_or_none(data.get("return_3m")) and number_or_none(data.get("return_3m")) > 75:
+    if r3 is not None and r3 > 75:
         score += 1
+    if cash is not None and annual_burn is not None:
+        runway_years = cash / annual_burn if annual_burn else None
+        if runway_years and runway_years > 3:
+            score -= 2
+        elif runway_years and runway_years < 1:
+            score += 2
     return clamp_score(score)
 
 
@@ -564,6 +601,11 @@ def build_evidence_flags(scores: dict[str, int], data: dict[str, Any]) -> list[s
         flags.append("fundamentals do not yet validate the tape")
     if scores["Dilution Risk"] >= 7:
         flags.append("losses plus rally create dilution/financing risk")
+    runway = cash_runway_years(data)
+    if runway is not None and runway > 3:
+        flags.append(f"cash runway appears strong at roughly {runway:,.1f} years of current FCF burn")
+    elif runway is not None and runway < 1:
+        flags.append(f"cash runway appears tight at roughly {runway:,.1f} years of current FCF burn")
     if scores["Squeeze Risk"] >= 7:
         flags.append("short-interest setup can amplify moves")
     if scores["Asymmetry"] <= 4:
@@ -571,6 +613,17 @@ def build_evidence_flags(scores: dict[str, int], data: dict[str, Any]) -> list[s
     elif scores["Asymmetry"] >= 7:
         flags.append("asymmetry favorable if catalyst confirms")
     return flags
+
+
+def cash_runway_years(data: dict[str, Any]) -> float | None:
+    cash = number_or_none(data.get("total_cash"))
+    fcf = number_or_none(data.get("free_cashflow"))
+    if cash is None or fcf is None or fcf >= 0:
+        return None
+    burn = abs(fcf)
+    if burn == 0:
+        return None
+    return cash / burn
 
 
 def build_trade_verdict(scores: dict[str, int], data: dict[str, Any], flags: list[str]) -> dict[str, str]:
