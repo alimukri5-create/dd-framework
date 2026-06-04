@@ -419,6 +419,13 @@ def clean_model_text(text: str | None) -> str:
     """Repair common mojibake sequences that can appear in exported model text."""
     if not text:
         return ""
+    if any(marker in text for marker in ["Ã", "Â", "â"]):
+        try:
+            repaired = text.encode("latin1").decode("utf-8")
+            if repaired.count("\ufffd") <= text.count("\ufffd"):
+                text = repaired
+        except UnicodeError:
+            pass
     replacements = {
         "\u00e2\u20ac\u2122": "'",
         "\u00e2\u20ac\u02dc": "'",
@@ -438,7 +445,18 @@ def clean_model_text(text: str | None) -> str:
     cleaned = text
     for broken, fixed in replacements.items():
         cleaned = cleaned.replace(broken, fixed)
+    cleaned = apply_known_fact_guards(cleaned)
     return cleaned.strip()
+
+
+def apply_known_fact_guards(text: str) -> str:
+    lower = text.lower()
+    if "ouster" in lower and "velodyne" in lower and "ouster completed its merger with velodyne" not in lower:
+        text += (
+            "\n\nData quality note: Ouster completed its merger with Velodyne in 2023, "
+            "so Velodyne should not be treated as a current standalone competitor."
+        )
+    return text
 
 
 def extract_responses_text(response: Any) -> str:
