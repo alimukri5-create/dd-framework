@@ -1,16 +1,37 @@
 # DD Framework - Institutional Due Diligence
 
-Production-grade Streamlit app for a three-step OpenAI-powered equity due diligence workflow.
+Production-grade Streamlit app for decision-first equity due diligence and trading insight.
+
+The V2 engine computes deterministic market evidence first, then uses OpenAI to explain the setup tersely.
+The goal is not a company story; it is a fast read on whether a ticker is chaseable, waitlist-only, event-driven,
+or avoid.
 
 ## Features
 
 - Ticker input and validation
-- Three sequential GPT analysis steps
+- Deterministic V2 evidence engine
+- Three sequential GPT synthesis steps
 - Cached ticker reports with a cached-on timestamp
-- Dashboard scores from 1-10
+- Dashboard scores from 1-10 for momentum, exhaustion, fundamentals, valuation, catalyst, dilution, squeeze, and asymmetry
 - Recommendation: PROCEED, HOLD, or AVOID
+- Trade verdict: CHASEABLE, WAIT FOR PULLBACK, EVENT WATCH, WATCHLIST, or AVOID CHASING
 - JSON, Markdown, and copy-to-clipboard exports
 - Friendly handling for missing API keys, invalid tickers, rate limits, timeouts, and API errors
+
+## V2 Logic
+
+The app pulls a market data pack using yfinance, then computes:
+
+- Momentum
+- Exhaustion Risk
+- Fundamental Validation
+- Valuation Stretch
+- Catalyst Proximity
+- Dilution Risk
+- Squeeze Risk
+- Asymmetry
+
+OpenAI receives those computed facts and explains the trade setup, catalyst, invalidation trigger, and key metric.
 
 ## Setup
 

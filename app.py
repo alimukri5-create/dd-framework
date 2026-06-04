@@ -23,10 +23,14 @@ APP_TITLE = "DD Framework - Institutional Due Diligence"
 DEFAULT_MODEL = "gpt-4-turbo"
 DEFAULT_TIMEOUT_SECONDS = 180
 SCORE_NAMES = [
-    "Setup Quality",
-    "Catalyst Clarity",
-    "Risk/Reward",
-    "Decision Confidence",
+    "Momentum",
+    "Exhaustion Risk",
+    "Fundamental Validation",
+    "Valuation Stretch",
+    "Catalyst Proximity",
+    "Dilution Risk",
+    "Squeeze Risk",
+    "Asymmetry",
 ]
 
 SYSTEM_PROMPT = """
@@ -54,6 +58,8 @@ class DDResult:
     recommendation_reason: str
     decision_card: dict[str, str]
     market_snapshot: dict[str, str]
+    trade_verdict: dict[str, str]
+    evidence_flags: list[str]
 
 
 class UserFacingError(Exception):
@@ -291,6 +297,290 @@ def build_market_snapshot(data: dict[str, Any]) -> dict[str, str]:
     return snapshot
 
 
+def build_v2_evidence_engine(data: dict[str, Any]) -> tuple[dict[str, int], dict[str, str], list[str]]:
+    """Score the setup using deterministic trade-decision heuristics."""
+    if data.get("error"):
+        scores = {name: 5 for name in SCORE_NAMES}
+        verdict = {
+            "Verdict": "DATA LIMITED",
+            "Action": "HOLD",
+            "Bias": "WATCHLIST",
+            "Trade Type": "NO EDGE",
+            "Why": data["error"],
+            "Confirm": "Restore market data before acting.",
+            "Invalidate": "N/A",
+            "Asymmetry": "Cannot assess without market data.",
+        }
+        return scores, verdict, [data["error"]]
+
+    scores = {
+        "Momentum": score_momentum(data),
+        "Exhaustion Risk": score_exhaustion_risk(data),
+        "Fundamental Validation": score_fundamental_validation(data),
+        "Valuation Stretch": score_valuation_stretch(data),
+        "Catalyst Proximity": score_catalyst_proximity(data),
+        "Dilution Risk": score_dilution_risk(data),
+        "Squeeze Risk": score_squeeze_risk(data),
+    }
+    scores["Asymmetry"] = score_asymmetry(scores, data)
+    flags = build_evidence_flags(scores, data)
+    return scores, build_trade_verdict(scores, data, flags), flags
+
+
+def score_momentum(data: dict[str, Any]) -> int:
+    score = 5
+    r5 = number_or_none(data.get("return_5d")) or 0
+    r1 = number_or_none(data.get("return_1m")) or 0
+    r3 = number_or_none(data.get("return_3m")) or 0
+    volume_ratio = volume_surge_ratio(data)
+    if r5 > 8:
+        score += 1
+    if r1 > 20:
+        score += 1
+    if r1 > 50:
+        score += 1
+    if r3 > 50:
+        score += 1
+    if volume_ratio and volume_ratio > 1.5:
+        score += 1
+    if r1 < -20:
+        score -= 2
+    if r3 < -30:
+        score -= 2
+    return clamp_score(score)
+
+
+def score_exhaustion_risk(data: dict[str, Any]) -> int:
+    score = 3
+    r1 = number_or_none(data.get("return_1m")) or 0
+    r3 = number_or_none(data.get("return_3m")) or 0
+    price = number_or_none(data.get("current_price") or data.get("last_close"))
+    high = number_or_none(data.get("fifty_two_week_high"))
+    if r1 > 40:
+        score += 2
+    if r3 > 80:
+        score += 2
+    if r3 > 150:
+        score += 1
+    if price and high and high > 0 and price / high > 0.9:
+        score += 1
+    if number_or_none(data.get("beta")) and number_or_none(data.get("beta")) >= 2:
+        score += 1
+    return clamp_score(score)
+
+
+def score_fundamental_validation(data: dict[str, Any]) -> int:
+    score = 5
+    revenue_growth = number_or_none(data.get("revenue_growth"))
+    gross = number_or_none(data.get("gross_margins"))
+    op = number_or_none(data.get("operating_margins"))
+    net = number_or_none(data.get("profit_margins"))
+    if revenue_growth is not None and revenue_growth > 0.25:
+        score += 2
+    elif revenue_growth is not None and revenue_growth < 0:
+        score -= 2
+    if gross is not None and gross > 0.4:
+        score += 1
+    if op is not None and op < -0.2:
+        score -= 2
+    elif op is not None and op > 0:
+        score += 2
+    if net is not None and net < -0.2:
+        score -= 1
+    elif net is not None and net > 0:
+        score += 1
+    return clamp_score(score)
+
+
+def score_valuation_stretch(data: dict[str, Any]) -> int:
+    score = 3
+    ps = number_or_none(data.get("price_to_sales"))
+    if ps is None:
+        return 5
+    if ps > 5:
+        score += 2
+    if ps > 10:
+        score += 2
+    if ps > 20:
+        score += 1
+    revenue_growth = number_or_none(data.get("revenue_growth"))
+    if revenue_growth is not None and revenue_growth > 0.4:
+        score -= 1
+    if number_or_none(data.get("operating_margins")) and number_or_none(data.get("operating_margins")) < 0:
+        score += 1
+    return clamp_score(score)
+
+
+def score_catalyst_proximity(data: dict[str, Any]) -> int:
+    score = 5
+    if abs(number_or_none(data.get("return_5d")) or 0) > 8:
+        score += 1
+    if volume_surge_ratio(data) and volume_surge_ratio(data) > 1.5:
+        score += 1
+    if number_or_none(data.get("revenue_growth")) and number_or_none(data.get("revenue_growth")) > 0.25:
+        score += 1
+    if number_or_none(data.get("operating_margins")) and number_or_none(data.get("operating_margins")) < -0.3:
+        score += 1
+    return clamp_score(score)
+
+
+def score_dilution_risk(data: dict[str, Any]) -> int:
+    score = 3
+    if number_or_none(data.get("operating_margins")) and number_or_none(data.get("operating_margins")) < -0.2:
+        score += 2
+    if number_or_none(data.get("profit_margins")) and number_or_none(data.get("profit_margins")) < -0.2:
+        score += 1
+    if number_or_none(data.get("price_to_sales")) and number_or_none(data.get("price_to_sales")) > 10:
+        score += 1
+    if number_or_none(data.get("return_3m")) and number_or_none(data.get("return_3m")) > 75:
+        score += 1
+    return clamp_score(score)
+
+
+def score_squeeze_risk(data: dict[str, Any]) -> int:
+    score = 3
+    short_float = number_or_none(data.get("short_percent_float"))
+    if short_float is not None:
+        if short_float > 0.1:
+            score += 2
+        if short_float > 0.2:
+            score += 2
+    if number_or_none(data.get("return_5d")) and number_or_none(data.get("return_5d")) > 8:
+        score += 1
+    if volume_surge_ratio(data) and volume_surge_ratio(data) > 2:
+        score += 1
+    return clamp_score(score)
+
+
+def score_asymmetry(scores: dict[str, int], data: dict[str, Any]) -> int:
+    score = 5
+    if scores["Fundamental Validation"] >= 7:
+        score += 2
+    if scores["Catalyst Proximity"] >= 7:
+        score += 1
+    if scores["Momentum"] >= 7 and scores["Exhaustion Risk"] <= 6:
+        score += 1
+    if scores["Valuation Stretch"] >= 7:
+        score -= 2
+    if scores["Dilution Risk"] >= 7:
+        score -= 1
+    if scores["Exhaustion Risk"] >= 8:
+        score -= 2
+    return clamp_score(score)
+
+
+def build_evidence_flags(scores: dict[str, int], data: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+    r1 = number_or_none(data.get("return_1m"))
+    r3 = number_or_none(data.get("return_3m"))
+    if r1 is not None:
+        flags.append(f"1M return {r1:,.1f}%")
+    if r3 is not None:
+        flags.append(f"3M return {r3:,.1f}%")
+    if scores["Momentum"] >= 8:
+        flags.append("strong tape momentum")
+    if scores["Exhaustion Risk"] >= 8:
+        flags.append("move is statistically extended")
+    if scores["Valuation Stretch"] >= 7:
+        flags.append("valuation already prices strong execution")
+    if scores["Fundamental Validation"] <= 4:
+        flags.append("fundamentals do not yet validate the tape")
+    if scores["Dilution Risk"] >= 7:
+        flags.append("losses plus rally create dilution/financing risk")
+    if scores["Squeeze Risk"] >= 7:
+        flags.append("short-interest setup can amplify moves")
+    if scores["Asymmetry"] <= 4:
+        flags.append("asymmetry unfavorable until next confirming data point")
+    elif scores["Asymmetry"] >= 7:
+        flags.append("asymmetry favorable if catalyst confirms")
+    return flags
+
+
+def build_trade_verdict(scores: dict[str, int], data: dict[str, Any], flags: list[str]) -> dict[str, str]:
+    if scores["Asymmetry"] >= 7 and scores["Exhaustion Risk"] <= 6 and scores["Valuation Stretch"] <= 6:
+        verdict = "CHASEABLE"
+        action = "PROCEED"
+        bias = "LONG"
+        trade_type = "MOMENTUM WITH VALIDATION"
+    elif scores["Exhaustion Risk"] >= 8 and scores["Momentum"] >= 7:
+        verdict = "WAIT FOR PULLBACK"
+        action = "HOLD"
+        bias = "WATCHLIST"
+        trade_type = "EXTENDED MOMENTUM"
+    elif scores["Valuation Stretch"] >= 8 and scores["Fundamental Validation"] <= 5:
+        verdict = "AVOID CHASING"
+        action = "AVOID"
+        bias = "AVOID"
+        trade_type = "PRICED FOR PERFECTION"
+    elif scores["Catalyst Proximity"] >= 7:
+        verdict = "EVENT WATCH"
+        action = "HOLD"
+        bias = "WATCHLIST"
+        trade_type = "WAIT FOR CATALYST"
+    else:
+        verdict = "WATCHLIST"
+        action = "HOLD"
+        bias = "WATCHLIST"
+        trade_type = "NO CLEAR EDGE"
+
+    return {
+        "Verdict": verdict,
+        "Action": action,
+        "Bias": bias,
+        "Trade Type": trade_type,
+        "Why": "; ".join(flags[:3]) if flags else "No decisive deterministic edge.",
+        "Confirm": build_confirm_trigger(data),
+        "Invalidate": build_invalidation_trigger(data),
+        "Asymmetry": describe_asymmetry(scores),
+    }
+
+
+def build_confirm_trigger(data: dict[str, Any]) -> str:
+    if number_or_none(data.get("operating_margins")) and number_or_none(data.get("operating_margins")) < 0:
+        return "Revenue growth continues while operating margin loss narrows."
+    if number_or_none(data.get("return_1m")) and number_or_none(data.get("return_1m")) > 30:
+        return "Pullback holds above prior breakout and volume stays elevated."
+    return "Next catalyst confirms revenue, margin, or guidance improvement."
+
+
+def build_invalidation_trigger(data: dict[str, Any]) -> str:
+    if number_or_none(data.get("price_to_sales")) and number_or_none(data.get("price_to_sales")) > 10:
+        return "Growth or margin data disappoints while valuation remains premium."
+    if number_or_none(data.get("return_1m")) and number_or_none(data.get("return_1m")) > 30:
+        return "Momentum breaks and volume fades after an extended move."
+    return "Key KPI deteriorates at the next update."
+
+
+def describe_asymmetry(scores: dict[str, int]) -> str:
+    if scores["Asymmetry"] >= 7:
+        return "Positive skew if the next catalyst confirms fundamentals before valuation stretches further."
+    if scores["Asymmetry"] <= 4:
+        return "Negative skew: price/expectations look ahead of confirmed fundamentals."
+    return "Mixed skew: catalyst can move the stock, but confirmation is needed."
+
+
+def volume_surge_ratio(data: dict[str, Any]) -> float | None:
+    avg = number_or_none(data.get("average_volume"))
+    avg20 = number_or_none(data.get("avg_volume_20d"))
+    if not avg or not avg20:
+        return None
+    return avg20 / avg
+
+
+def format_engine_evidence(scores: dict[str, int], verdict: dict[str, str], flags: list[str]) -> str:
+    score_lines = "\n".join(f"{name}: {score}/10" for name, score in scores.items())
+    verdict_lines = "\n".join(f"{name}: {value}" for name, value in verdict.items())
+    flag_lines = "\n".join(f"- {flag}" for flag in flags) if flags else "- No decisive deterministic flags."
+    return f"""DETERMINISTIC ENGINE SCORES
+{score_lines}
+
+DETERMINISTIC TRADE VERDICT
+{verdict_lines}
+
+EVIDENCE FLAGS
+{flag_lines}"""
+
+
 def build_quick_read(data: dict[str, Any]) -> str:
     flags: list[str] = []
     if number_or_none(data.get("return_1m")) and number_or_none(data.get("return_1m")) >= 50:
@@ -355,6 +645,19 @@ def load_cache(ticker: str) -> DDResult | None:
             data["decision_card"] = extract_decision_card(data.get("step_3", ""), recommendation, reason)
         if "market_snapshot" not in data:
             data["market_snapshot"] = {}
+        if "trade_verdict" not in data:
+            data["trade_verdict"] = {
+                "Verdict": data.get("recommendation", "HOLD"),
+                "Action": data.get("recommendation", "HOLD"),
+                "Bias": "WATCHLIST",
+                "Trade Type": "LEGACY CACHE",
+                "Why": data.get("recommendation_reason", "Legacy cached result."),
+                "Confirm": "Refresh analysis for V2 evidence engine.",
+                "Invalidate": "Refresh analysis for V2 evidence engine.",
+                "Asymmetry": "Legacy cached result.",
+            }
+        if "evidence_flags" not in data:
+            data["evidence_flags"] = []
         return DDResult(**data)
     except (json.JSONDecodeError, TypeError, OSError):
         return None
@@ -469,7 +772,7 @@ def extract_responses_text(response: Any) -> str:
     return "\n".join(chunks)
 
 
-def build_step_1_prompt(ticker: str, market_data: str) -> str:
+def build_step_1_prompt(ticker: str, market_data: str, engine_evidence: str) -> str:
     return f"""
 Research {ticker} for a fast trading decision.
 
@@ -477,6 +780,11 @@ Use this market data pack as your factual starting point. If a value is missing,
 Do not replace missing values with generic guesses.
 
 {market_data}
+
+Use this deterministic evidence engine as the trading frame. Do not ignore it or replace it with generic
+company commentary.
+
+{engine_evidence}
 
 Return a concise decision briefing, not a company story:
 1. WHAT MOVES THE STOCK: top 3 drivers in the next 1-90 days.
@@ -492,15 +800,18 @@ Format: 350-500 words. Use bullets. No background filler.
 """.strip()
 
 
-def build_step_2_prompt(step_1: str) -> str:
+def build_step_2_prompt(step_1: str, engine_evidence: str) -> str:
     return f"""
 Based on Step 1: {step_1}
 
+Keep this deterministic evidence engine in view:
+{engine_evidence}
+
 Convert the company facts into investable/tradable economics:
 1. ECONOMIC ENGINE: what KPI actually drives the stock for this sector? Examples: orders/bookings, ARPU,
-   churn, gross margin, utilization, commodity price, reimbursement, deliveries, backlog, licensing, FCF.
+   churn, gross margin, utilization, commodity price exposure, deliveries, backlog, licensing, FCF.
 2. CUSTOMER/UNIT ECONOMICS: switching cost, replacement/upgrade cycle, payback, recurring revenue,
-   margin structure, or sector-equivalent economics. If hospital/reimbursement is irrelevant, say N/A.
+   margin structure, or sector-equivalent economics. If a metric is irrelevant for the sector, say N/A.
 3. CATALYST MAP: next 3 likely catalysts, expected timing, and whether each is bullish/bearish/ambiguous.
 4. STALL MAP: what would make the thesis fail fast?
 5. FAST CHECK: what single data point should a trader verify before acting?
@@ -509,11 +820,14 @@ Format: 350-500 words. Use bullets/table style. Show confidence. No repeated com
 """.strip()
 
 
-def build_step_3_prompt(step_1: str, step_2: str) -> str:
+def build_step_3_prompt(step_1: str, step_2: str, engine_evidence: str) -> str:
     return f"""
 Based on Steps 1-2: {step_1}
 
 {step_2}
+
+The deterministic evidence engine is the primary decision layer:
+{engine_evidence}
 
 Produce a decision-first trading dashboard:
 1. DECISION: PROCEED / HOLD / AVOID. Also give bias: LONG / WATCHLIST / AVOID.
@@ -550,6 +864,8 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     market_data = fetch_market_data(ticker)
     market_data_text = format_market_data(market_data)
     market_snapshot = build_market_snapshot(market_data)
+    engine_scores, trade_verdict, evidence_flags = build_v2_evidence_engine(market_data)
+    engine_evidence = format_engine_evidence(engine_scores, trade_verdict, evidence_flags)
     if market_data.get("error"):
         st.warning(market_data["error"])
     else:
@@ -560,22 +876,32 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     step_3_box = st.empty()
 
     with step_1_box.container():
-        with st.spinner("Step 1: researching business model, moat, metrics, and confidence..."):
-            step_1 = call_openai(client, build_step_1_prompt(ticker, market_data_text), model, step_name="Step 1")
-        render_step("Step 1 - Business, Moat, Metrics", step_1)
+        with st.spinner("Step 1: building fast setup and stock-mover map..."):
+            step_1 = call_openai(
+                client,
+                build_step_1_prompt(ticker, market_data_text, engine_evidence),
+                model,
+                step_name="Step 1",
+            )
+        render_step("Step 1 - Fast Setup", step_1)
 
     with step_2_box.container():
-        with st.spinner("Step 2: analyzing hospital economics, reimbursement, growth, and unit economics..."):
-            step_2 = call_openai(client, build_step_2_prompt(step_1), model, step_name="Step 2")
-        render_step("Step 2 - Economics, Reimbursement, Growth", step_2)
+        with st.spinner("Step 2: mapping economic engine, catalysts, and stalls..."):
+            step_2 = call_openai(client, build_step_2_prompt(step_1, engine_evidence), model, step_name="Step 2")
+        render_step("Step 2 - Economic Engine", step_2)
 
     with step_3_box.container():
-        with st.spinner("Step 3: building bull/bear assessment and moat outlook..."):
-            step_3 = call_openai(client, build_step_3_prompt(step_1, step_2), model, step_name="Step 3")
-        render_step("Step 3 - Bull/Bear Assessment", step_3)
+        with st.spinner("Step 3: translating evidence into decision card..."):
+            step_3 = call_openai(
+                client,
+                build_step_3_prompt(step_1, step_2, engine_evidence),
+                model,
+                step_name="Step 3",
+            )
+        render_step("Step 3 - Decision Support", step_3)
 
-    scores = extract_dashboard_scores(step_1, step_2, step_3)
-    recommendation, reason = build_recommendation(scores, step_3)
+    recommendation = trade_verdict["Action"]
+    reason = trade_verdict["Why"]
     decision_card = extract_decision_card(step_3, recommendation, reason)
     result = DDResult(
         ticker=ticker,
@@ -585,11 +911,13 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         step_1=step_1,
         step_2=step_2,
         step_3=step_3,
-        dashboard_scores=scores,
+        dashboard_scores=engine_scores,
         recommendation=recommendation,
         recommendation_reason=reason,
         decision_card=decision_card,
         market_snapshot=market_snapshot,
+        trade_verdict=trade_verdict,
+        evidence_flags=evidence_flags,
     )
     save_cache(result)
     return result
@@ -756,6 +1084,8 @@ def export_markdown(result: DDResult) -> str:
     scores = "\n".join(f"- **{name}:** {score}/10" for name, score in result.dashboard_scores.items())
     decision = "\n".join(f"- **{name}:** {value}" for name, value in result.decision_card.items())
     market = "\n".join(f"- **{name}:** {value}" for name, value in result.market_snapshot.items())
+    verdict = "\n".join(f"- **{name}:** {value}" for name, value in result.trade_verdict.items())
+    flags = "\n".join(f"- {flag}" for flag in result.evidence_flags)
     company = f"\n**Company:** {result.company_name}" if result.company_name else ""
     return f"""# {APP_TITLE}
 
@@ -773,25 +1103,48 @@ def export_markdown(result: DDResult) -> str:
 
 {market}
 
+## V2 Trade Verdict
+
+{verdict}
+
+## Evidence Flags
+
+{flags}
+
 ## Decision Card
 
 {decision}
 
-## Step 1 - Business, Moat, Metrics
+## Step 1 - Fast Setup
 
 {result.step_1}
 
-## Step 2 - Economics, Reimbursement, Growth
+## Step 2 - Economic Engine
 
 {result.step_2}
 
-## Step 3 - Bull/Bear Assessment
+## Step 3 - Decision Support
 
 {result.step_3}
 """
 
 
 def render_dashboard(result: DDResult) -> None:
+    st.subheader("V2 Trade Verdict")
+    verdict = result.trade_verdict
+    verdict_cols = st.columns([1.2, 1, 1.2, 1.6])
+    verdict_cols[0].metric("Verdict", verdict.get("Verdict", result.recommendation))
+    verdict_cols[1].metric("Action", verdict.get("Action", result.recommendation))
+    verdict_cols[2].metric("Bias", verdict.get("Bias", "WATCHLIST"))
+    verdict_cols[3].metric("Trade Type", verdict.get("Trade Type", "N/A"))
+    with st.container(border=True):
+        st.markdown(f"**Why:** {verdict.get('Why', result.recommendation_reason)}")
+        st.markdown(f"**Confirm:** {verdict.get('Confirm', 'Not specified')}")
+        st.markdown(f"**Invalidate:** {verdict.get('Invalidate', 'Not specified')}")
+        st.markdown(f"**Asymmetry:** {verdict.get('Asymmetry', 'Not specified')}")
+        if result.evidence_flags:
+            st.markdown("**Evidence flags:** " + " | ".join(result.evidence_flags))
+
     if result.market_snapshot:
         st.subheader("Market Snapshot")
         snap_cols = st.columns(min(4, max(1, len(result.market_snapshot))))
@@ -816,10 +1169,10 @@ def render_dashboard(result: DDResult) -> None:
             f"{card.get('Bear Probability', 'Not specified')}"
         )
 
-    st.subheader("Setup Scores")
+    st.subheader("V2 Evidence Scores")
     cols = st.columns(4)
-    for col, name in zip(cols, SCORE_NAMES):
-        col.metric(name, f"{result.dashboard_scores.get(name, 0)}/10")
+    for index, name in enumerate(SCORE_NAMES):
+        cols[index % len(cols)].metric(name, f"{result.dashboard_scores.get(name, 0)}/10")
 
     rec = result.recommendation
     if rec == "PROCEED":
@@ -929,9 +1282,9 @@ def main() -> None:
             render_cached_notice(result)
 
         render_dashboard(result)
-        render_step("Step 1 - Business, Moat, Metrics", result.step_1)
-        render_step("Step 2 - Economics, Reimbursement, Growth", result.step_2)
-        render_step("Step 3 - Bull/Bear Assessment", result.step_3)
+        render_step("Step 1 - Fast Setup", result.step_1)
+        render_step("Step 2 - Economic Engine", result.step_2)
+        render_step("Step 3 - Decision Support", result.step_3)
         render_exports(result)
     except UserFacingError as exc:
         st.error(str(exc))
