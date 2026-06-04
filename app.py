@@ -830,7 +830,8 @@ The deterministic evidence engine is the primary decision layer:
 {engine_evidence}
 
 Produce a decision-first trading dashboard:
-1. DECISION: PROCEED / HOLD / AVOID. Also give bias: LONG / WATCHLIST / AVOID.
+1. DECISION: Use the deterministic trade verdict exactly. Distinguish the verdict from action:
+   for example, WAIT FOR PULLBACK can map to Action: HOLD and Bias: WATCHLIST.
 2. WHY NOW: one sentence. If no near-term edge, say so.
 3. BULL CASE: 3 drivers, what goes right, probability (%), trigger to confirm.
 4. BEAR CASE: 3 risks, what breaks, probability (%), trigger to invalidate.
@@ -839,6 +840,8 @@ Produce a decision-first trading dashboard:
 
 End with this exact block:
 TRADING_DECISION_CARD
+Engine Verdict: [use deterministic Verdict exactly]
+Trade Type: [use deterministic Trade Type exactly]
 Action: PROCEED/HOLD/AVOID
 Bias: LONG/WATCHLIST/AVOID
 Horizon: [timeframe]
@@ -903,6 +906,10 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     recommendation = trade_verdict["Action"]
     reason = trade_verdict["Why"]
     decision_card = extract_decision_card(step_3, recommendation, reason)
+    decision_card["Engine Verdict"] = trade_verdict["Verdict"]
+    decision_card["Trade Type"] = trade_verdict["Trade Type"]
+    decision_card["Action"] = trade_verdict["Action"]
+    decision_card["Bias"] = trade_verdict["Bias"]
     result = DDResult(
         ticker=ticker,
         company_name=extract_company_name(step_1),
