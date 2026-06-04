@@ -15,6 +15,7 @@ from typing import Any
 
 import streamlit as st
 import streamlit.components.v1 as components
+import requests
 import yfinance as yf
 from openai import APIConnectionError, APIError, APITimeoutError, AuthenticationError, OpenAI, RateLimitError
 
@@ -156,6 +157,7 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
         "ticker": ticker,
         "source": "Yahoo Finance via yfinance",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "is_stale": False,
     }
     try:
         clear_proxy_env_for_market_data()
@@ -166,6 +168,16 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
         info = asset.get_info() or {}
         history = asset.history(period="6mo", interval="1d", auto_adjust=True)
     except Exception as exc:
+        fallback = fetch_chart_fallback(ticker, str(exc))
+        if fallback and not fallback.get("error"):
+            save_market_data_cache(ticker, fallback)
+            return fallback
+        cached = load_market_data_cache(ticker)
+        if cached:
+            cached["is_stale"] = True
+            cached["stale_reason"] = f"Fresh market data fetch failed: {exc}"
+            cached["source"] = f"{cached.get('source', 'Cached market data')} (stale fallback)"
+            return cached
         data["error"] = f"Market data fetch failed: {exc}"
         return data
 
@@ -208,7 +220,66 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
                 "avg_volume_20d": float(volume.tail(20).mean()) if volume is not None and len(volume) else None,
             }
         )
+    save_market_data_cache(ticker, data)
     return data
+
+
+def fetch_chart_fallback(ticker: str, original_error: str) -> dict[str, Any] | None:
+    """Fetch lightweight Yahoo chart data when yfinance's richer endpoints are rate-limited."""
+    try:
+        clear_proxy_env_for_market_data()
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        response = requests.get(
+            url,
+            params={"range": "6mo", "interval": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("chart", {}).get("result", [{}])[0]
+        meta = result.get("meta", {})
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+        close_values = [value for value in result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", []) if value]
+        if not close_values:
+            close_values = [value for value in quote.get("close", []) if value]
+        volume_values = [value for value in quote.get("volume", []) if value]
+        data: dict[str, Any] = {
+            "ticker": ticker,
+            "source": "Yahoo Finance chart endpoint fallback",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "is_stale": False,
+            "fallback_reason": original_error,
+            "current_price": meta.get("regularMarketPrice"),
+            "fifty_two_week_high": meta.get("fiftyTwoWeekHigh"),
+            "fifty_two_week_low": meta.get("fiftyTwoWeekLow"),
+            "average_volume": meta.get("averageDailyVolume3Month"),
+        }
+        if close_values:
+            data.update(
+                {
+                    "last_close": float(close_values[-1]),
+                    "return_5d": pct_return_list(close_values, 5),
+                    "return_1m": pct_return_list(close_values, 21),
+                    "return_3m": pct_return_list(close_values, 63),
+                    "return_6m": pct_return_list(close_values, 126),
+                }
+            )
+        if volume_values:
+            data["avg_volume_20d"] = sum(volume_values[-20:]) / min(len(volume_values), 20)
+        return data
+    except Exception:
+        return None
+
+
+def pct_return_list(values: list[float], periods: int) -> float | None:
+    if len(values) <= periods:
+        return None
+    start = float(values[-periods - 1])
+    end = float(values[-1])
+    if start == 0:
+        return None
+    return (end / start - 1) * 100
 
 
 def clear_proxy_env_for_market_data() -> None:
@@ -282,6 +353,12 @@ def build_market_snapshot(data: dict[str, Any]) -> dict[str, str]:
         return {"Data": data["error"]}
 
     snapshot: dict[str, str] = {}
+    if data.get("is_stale"):
+        snapshot["Data Status"] = "STALE FALLBACK"
+    elif data.get("fallback_reason"):
+        snapshot["Data Status"] = "LIGHTWEIGHT FALLBACK"
+    else:
+        snapshot["Data Status"] = "FRESH"
     snapshot["Price"] = format_market_value(data.get("current_price") or data.get("last_close") or "N/A")
     snapshot["1M / 3M"] = (
         f"{format_percent(data.get('return_1m'))} / {format_percent(data.get('return_3m'))}"
@@ -629,6 +706,35 @@ def get_cache_dir() -> Path:
     return cache_dir
 
 
+def get_market_cache_dir() -> Path:
+    cache_dir = get_cache_dir() / "market_data"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def market_cache_path_for_ticker(ticker: str) -> Path:
+    return get_market_cache_dir() / f"{ticker}.json"
+
+
+def load_market_data_cache(ticker: str) -> dict[str, Any] | None:
+    path = market_cache_path_for_ticker(ticker)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_market_data_cache(ticker: str, data: dict[str, Any]) -> None:
+    if data.get("error"):
+        return
+    market_cache_path_for_ticker(ticker).write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def cache_path_for_ticker(ticker: str) -> Path:
     return get_cache_dir() / f"{ticker}.json"
 
@@ -871,6 +977,14 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     engine_evidence = format_engine_evidence(engine_scores, trade_verdict, evidence_flags)
     if market_data.get("error"):
         st.warning(market_data["error"])
+        raise UserFacingError(
+            "Market data is temporarily unavailable and no cached fallback exists for this ticker. "
+            "Wait a few minutes, then rerun with Refresh cache enabled."
+        )
+    elif market_data.get("is_stale"):
+        st.warning(f"Using stale market data fallback. {market_data.get('stale_reason', '')}")
+    elif market_data.get("fallback_reason"):
+        st.warning("Using lightweight market-data fallback because the richer Yahoo Finance endpoint was unavailable.")
     else:
         st.success(f"Loaded market data from {market_data['source']}.")
 
