@@ -2,36 +2,54 @@
 
 Production-grade Streamlit app for decision-first equity due diligence and trading insight.
 
-The V2 engine computes deterministic market evidence first, then uses OpenAI to explain the setup tersely.
+The V2.1 engine computes deterministic market, financial, ownership, earnings, and narrative evidence first,
+then uses OpenAI to explain the setup tersely.
 The goal is not a company story; it is a fast read on whether a ticker is chaseable, waitlist-only, event-driven,
 or avoid.
 
 ## Features
 
 - Ticker input and validation
-- Deterministic V2 evidence engine
+- Deterministic V2.1 evidence engine
+- Earnings date/surprise intelligence
+- Quarterly financial trend extraction
+- Ownership, insider, analyst recommendation, and narrative heat checks
 - Three sequential GPT synthesis steps
 - Cached ticker reports with a cached-on timestamp
-- Dashboard scores from 1-10 for momentum, exhaustion, fundamentals, valuation, catalyst, dilution, squeeze, and asymmetry
+- Dashboard scores from 1-10 for momentum, exhaustion, fundamental trend, valuation stretch, event risk,
+  dilution, ownership signal, narrative heat, squeeze risk, and asymmetry
 - Recommendation: PROCEED, HOLD, or AVOID
 - Trade verdict: CHASEABLE, WAIT FOR PULLBACK, EVENT WATCH, WATCHLIST, or AVOID CHASING
 - JSON, Markdown, and copy-to-clipboard exports
 - Friendly handling for missing API keys, invalid tickers, rate limits, timeouts, and API errors
 
-## V2 Logic
+## V2.1 Logic
 
-The app pulls a market data pack using yfinance, then computes:
+The app pulls public market intelligence using yfinance/Yahoo Finance, then computes:
 
 - Momentum
 - Exhaustion Risk
-- Fundamental Validation
+- Fundamental Trend
 - Valuation Stretch
-- Catalyst Proximity
+- Event Risk
 - Dilution Risk
+- Ownership Signal
+- Narrative Heat
 - Squeeze Risk
 - Asymmetry
 
 OpenAI receives those computed facts and explains the trade setup, catalyst, invalidation trigger, and key metric.
+The model is synthesis, not the primary scoring engine.
+
+## Decision Philosophy
+
+The framework is built for quick trading decisions:
+
+- Avoid chasing hot stories when fundamentals, dilution, or valuation do not confirm the move.
+- Separate real setup quality from narrative heat.
+- Reward catalysts only when timing and evidence are visible.
+- Treat missing data as a risk signal instead of filling gaps with confident prose.
+- Surface the one or two datapoints that would change the view.
 
 ## Setup
 

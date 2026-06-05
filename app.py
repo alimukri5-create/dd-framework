@@ -26,10 +26,12 @@ DEFAULT_TIMEOUT_SECONDS = 180
 SCORE_NAMES = [
     "Momentum",
     "Exhaustion Risk",
-    "Fundamental Validation",
+    "Fundamental Trend",
     "Valuation Stretch",
-    "Catalyst Proximity",
+    "Event Risk",
     "Dilution Risk",
+    "Ownership Signal",
+    "Narrative Heat",
     "Squeeze Risk",
     "Asymmetry",
 ]
@@ -61,6 +63,10 @@ class DDResult:
     market_snapshot: dict[str, str]
     trade_verdict: dict[str, str]
     evidence_flags: list[str]
+    earnings_intel: dict[str, str]
+    financial_trends: dict[str, str]
+    ownership_intel: dict[str, str]
+    narrative_heat: dict[str, str]
 
 
 class UserFacingError(Exception):
@@ -281,6 +287,264 @@ def fetch_chart_fallback(ticker: str, original_error: str) -> dict[str, Any] | N
         return None
 
 
+def fetch_v21_data(ticker: str) -> dict[str, Any]:
+    """Fetch richer DD layers that can fail independently from the core market pack."""
+    clear_proxy_env_for_market_data()
+    data: dict[str, Any] = {
+        "earnings_intel": {},
+        "financial_trends": {},
+        "ownership_intel": {},
+        "narrative_heat": {},
+    }
+    try:
+        yf_cache_dir = Path(tempfile.gettempdir()) / "dd-framework-yfinance-cache"
+        yf_cache_dir.mkdir(parents=True, exist_ok=True)
+        yf.set_tz_cache_location(str(yf_cache_dir))
+        asset = yf.Ticker(ticker)
+    except Exception as exc:
+        data["error"] = f"V2.1 data init failed: {exc}"
+        return data
+
+    data["earnings_intel"] = extract_earnings_intel(asset)
+    data["financial_trends"] = extract_financial_trends(asset)
+    data["ownership_intel"] = extract_ownership_intel(asset)
+    data["narrative_heat"] = extract_narrative_heat(asset)
+    return data
+
+
+def extract_earnings_intel(asset: Any) -> dict[str, str]:
+    intel: dict[str, str] = {}
+    try:
+        calendar = asset.calendar or {}
+        earnings_date = calendar.get("Earnings Date")
+        if isinstance(earnings_date, list) and earnings_date:
+            earnings_date = earnings_date[0]
+        if earnings_date:
+            intel["Next Earnings"] = str(earnings_date)
+            intel["Days To Earnings"] = days_until_text(earnings_date)
+        for key in ["Earnings Average", "Earnings High", "Earnings Low", "Revenue Average"]:
+            if calendar.get(key) is not None:
+                intel[key] = format_market_value(calendar.get(key))
+    except Exception as exc:
+        intel["Calendar Status"] = f"Unavailable: {exc}"
+
+    try:
+        dates = asset.earnings_dates
+        if dates is not None and not dates.empty:
+            last_reported = dates[dates["Reported EPS"].notna()].head(1)
+            if not last_reported.empty:
+                row = last_reported.iloc[0]
+                intel["Last Earnings Date"] = str(last_reported.index[0])
+                if row.get("EPS Estimate") is not None:
+                    intel["Last EPS Estimate"] = format_market_value(row.get("EPS Estimate"))
+                if row.get("Reported EPS") is not None:
+                    intel["Last Reported EPS"] = format_market_value(row.get("Reported EPS"))
+                if row.get("Surprise(%)") is not None:
+                    intel["Last EPS Surprise"] = f"{float(row.get('Surprise(%)')):,.1f}%"
+    except Exception as exc:
+        intel["Earnings History Status"] = f"Unavailable: {exc}"
+    return intel
+
+
+def extract_financial_trends(asset: Any) -> dict[str, str]:
+    trends: dict[str, str] = {}
+    try:
+        financials = asset.quarterly_financials
+        trends.update(
+            {
+                "Quarterly Revenue Trend": trend_from_statement(financials, ["Total Revenue"]),
+                "Quarterly Gross Profit Trend": trend_from_statement(financials, ["Gross Profit"]),
+                "Quarterly Operating Income Trend": trend_from_statement(
+                    financials, ["Operating Income", "Operating Revenue"]
+                ),
+                "Quarterly EBITDA Trend": trend_from_statement(financials, ["Normalized EBITDA", "EBITDA"]),
+            }
+        )
+    except Exception as exc:
+        trends["Financial Statement Status"] = f"Unavailable: {exc}"
+
+    try:
+        cashflow = asset.quarterly_cashflow
+        trends.update(
+            {
+                "Quarterly FCF Trend": trend_from_statement(cashflow, ["Free Cash Flow"]),
+                "Recent Capital Stock Issuance": latest_statement_value(cashflow, ["Issuance Of Capital Stock"]),
+                "Recent End Cash": latest_statement_value(cashflow, ["End Cash Position"]),
+            }
+        )
+    except Exception as exc:
+        trends["Cash Flow Status"] = f"Unavailable: {exc}"
+
+    try:
+        balance = asset.quarterly_balance_sheet
+        trends.update(
+            {
+                "Share Count Trend": trend_from_statement(balance, ["Ordinary Shares Number", "Share Issued"]),
+                "Recent Total Debt": latest_statement_value(balance, ["Total Debt"]),
+                "Recent Working Capital": latest_statement_value(balance, ["Working Capital"]),
+            }
+        )
+    except Exception as exc:
+        trends["Balance Sheet Status"] = f"Unavailable: {exc}"
+    return {key: value for key, value in trends.items() if value not in {"N/A", None, ""}}
+
+
+def extract_ownership_intel(asset: Any) -> dict[str, str]:
+    intel: dict[str, str] = {}
+    try:
+        holders = asset.major_holders
+        if holders is not None and not holders.empty:
+            values = holders["Value"].to_dict()
+            intel["Insiders Held"] = format_percent_ratio(values.get("insidersPercentHeld"))
+            intel["Institutions Held"] = format_percent_ratio(values.get("institutionsPercentHeld"))
+            intel["Institutions Float Held"] = format_percent_ratio(values.get("institutionsFloatPercentHeld"))
+            if values.get("institutionsCount") is not None:
+                intel["Institution Count"] = format_market_value(values.get("institutionsCount"))
+    except Exception as exc:
+        intel["Major Holders Status"] = f"Unavailable: {exc}"
+
+    try:
+        institutional = asset.institutional_holders
+        if institutional is not None and not institutional.empty:
+            top = institutional.head(3)
+            intel["Top Institutions"] = "; ".join(
+                f"{row.get('Holder')}: {format_percent_ratio(row.get('pctHeld'))}"
+                for _, row in top.iterrows()
+                if row.get("Holder") is not None
+            )
+    except Exception as exc:
+        intel["Institutional Holders Status"] = f"Unavailable: {exc}"
+
+    try:
+        insiders = asset.insider_transactions
+        if insiders is not None and not insiders.empty:
+            recent = insiders.head(10)
+            shares = numeric_series(recent.get("Shares")).sum()
+            value = numeric_series(recent.get("Value")).sum()
+            intel["Recent Insider Activity"] = f"{len(recent)} rows; shares {shares:,.0f}; value {value:,.0f}"
+            sample_text = "; ".join(str(item) for item in recent.get("Transaction", []).head(3).tolist() if item)
+            if sample_text:
+                intel["Recent Insider Transaction Types"] = sample_text
+    except Exception as exc:
+        intel["Insider Transactions Status"] = f"Unavailable: {exc}"
+
+    try:
+        recs = asset.recommendations
+        if recs is not None and not recs.empty:
+            row = recs.iloc[0]
+            intel["Analyst Recommendation Mix"] = (
+                f"strongBuy {row.get('strongBuy', 0)}, buy {row.get('buy', 0)}, "
+                f"hold {row.get('hold', 0)}, sell {row.get('sell', 0)}, strongSell {row.get('strongSell', 0)}"
+            )
+    except Exception as exc:
+        intel["Recommendations Status"] = f"Unavailable: {exc}"
+    return intel
+
+
+def extract_narrative_heat(asset: Any) -> dict[str, str]:
+    intel: dict[str, str] = {}
+    try:
+        news = asset.news or []
+        titles: list[str] = []
+        summaries: list[str] = []
+        for item in news[:10]:
+            content = item.get("content", {}) if isinstance(item, dict) else {}
+            title = content.get("title") or item.get("title")
+            summary = content.get("summary") or content.get("description") or item.get("summary")
+            if title:
+                titles.append(str(title))
+            if summary:
+                summaries.append(str(summary))
+        joined = " ".join(titles + summaries).lower()
+        intel["Headline Count"] = str(len(titles))
+        if titles:
+            intel["Top Headlines"] = " | ".join(titles[:3])
+        themes = detect_narrative_themes(joined)
+        intel["Narrative Themes"] = ", ".join(themes) if themes else "None obvious"
+        intel["Narrative Heat"] = narrative_heat_label(joined, len(titles), themes)
+    except Exception as exc:
+        intel["News Status"] = f"Unavailable: {exc}"
+    return intel
+
+
+def days_until_text(value: Any) -> str:
+    try:
+        if hasattr(value, "date"):
+            target = value.date()
+        else:
+            target = datetime.fromisoformat(str(value)).date()
+        delta = (target - datetime.now(timezone.utc).date()).days
+        return str(delta)
+    except Exception:
+        return "Unknown"
+
+
+def trend_from_statement(frame: Any, labels: list[str]) -> str:
+    if frame is None or frame.empty:
+        return "N/A"
+    series = statement_series(frame, labels)
+    if series is None or len(series) < 2:
+        return "N/A"
+    latest = float(series.iloc[0])
+    prior = float(series.iloc[1])
+    delta = latest - prior
+    pct = (delta / abs(prior) * 100) if prior else None
+    direction = "improving" if delta > 0 else "deteriorating" if delta < 0 else "flat"
+    pct_text = f", {pct:,.1f}% QoQ" if pct is not None else ""
+    return f"{format_market_value(latest)} vs {format_market_value(prior)} prior ({direction}{pct_text})"
+
+
+def latest_statement_value(frame: Any, labels: list[str]) -> str:
+    if frame is None or frame.empty:
+        return "N/A"
+    series = statement_series(frame, labels)
+    if series is None or len(series) == 0:
+        return "N/A"
+    return format_market_value(float(series.iloc[0]))
+
+
+def statement_series(frame: Any, labels: list[str]) -> Any | None:
+    for label in labels:
+        if label in frame.index:
+            return frame.loc[label].dropna()
+    return None
+
+
+def numeric_series(values: Any) -> Any:
+    try:
+        import pandas as pd
+
+        return pd.to_numeric(values, errors="coerce").fillna(0)
+    except Exception:
+        return []
+
+
+def detect_narrative_themes(text: str) -> list[str]:
+    theme_terms = {
+        "AI": [" ai ", "artificial intelligence", "physical ai"],
+        "Defense": ["defense", "aerospace", "military"],
+        "Critical Minerals": ["critical minerals", "rare earth", "neodymium", "dysprosium"],
+        "Autonomy": ["autonomous", "lidar", "robotaxi", "sensor"],
+        "Nuclear/Energy": ["nuclear", "uranium", "energy"],
+        "Momentum Coverage": ["surge", "rally", "soar", "upside", "too late"],
+    }
+    return [theme for theme, terms in theme_terms.items() if any(term in text for term in terms)]
+
+
+def narrative_heat_label(text: str, count: int, themes: list[str]) -> str:
+    heat = 0
+    heat += min(3, count // 3)
+    if themes:
+        heat += min(3, len(themes))
+    if any(word in text for word in ["surge", "rally", "soar", "too late", "momentum"]):
+        heat += 2
+    if heat >= 6:
+        return "High"
+    if heat >= 3:
+        return "Medium"
+    return "Low"
+
+
 def pct_return_list(values: list[float], periods: int) -> float | None:
     if len(values) <= periods:
         return None
@@ -397,8 +661,11 @@ def build_market_snapshot(data: dict[str, Any]) -> dict[str, str]:
     return snapshot
 
 
-def build_v2_evidence_engine(data: dict[str, Any]) -> tuple[dict[str, int], dict[str, str], list[str]]:
+def build_v2_evidence_engine(
+    data: dict[str, Any], v21_data: dict[str, Any] | None = None
+) -> tuple[dict[str, int], dict[str, str], list[str]]:
     """Score the setup using deterministic trade-decision heuristics."""
+    v21_data = v21_data or {}
     if data.get("error"):
         scores = {name: 5 for name in SCORE_NAMES}
         verdict = {
@@ -416,14 +683,16 @@ def build_v2_evidence_engine(data: dict[str, Any]) -> tuple[dict[str, int], dict
     scores = {
         "Momentum": score_momentum(data),
         "Exhaustion Risk": score_exhaustion_risk(data),
-        "Fundamental Validation": score_fundamental_validation(data),
+        "Fundamental Trend": score_fundamental_validation(data, v21_data),
         "Valuation Stretch": score_valuation_stretch(data),
-        "Catalyst Proximity": score_catalyst_proximity(data),
-        "Dilution Risk": score_dilution_risk(data),
+        "Event Risk": score_catalyst_proximity(data, v21_data),
+        "Dilution Risk": score_dilution_risk(data, v21_data),
+        "Ownership Signal": score_ownership_signal(v21_data),
+        "Narrative Heat": score_narrative_heat(v21_data),
         "Squeeze Risk": score_squeeze_risk(data),
     }
     scores["Asymmetry"] = score_asymmetry(scores, data)
-    flags = build_evidence_flags(scores, data)
+    flags = build_evidence_flags(scores, data, v21_data)
     return scores, build_trade_verdict(scores, data, flags), flags
 
 
@@ -469,7 +738,7 @@ def score_exhaustion_risk(data: dict[str, Any]) -> int:
     return clamp_score(score)
 
 
-def score_fundamental_validation(data: dict[str, Any]) -> int:
+def score_fundamental_validation(data: dict[str, Any], v21_data: dict[str, Any]) -> int:
     score = 5
     revenue_growth = number_or_none(data.get("revenue_growth"))
     gross = number_or_none(data.get("gross_margins"))
@@ -489,6 +758,20 @@ def score_fundamental_validation(data: dict[str, Any]) -> int:
         score -= 1
     elif net is not None and net > 0:
         score += 1
+    trends = v21_data.get("financial_trends", {})
+    trend_text = " ".join(trends.values()).lower()
+    if "quarterly revenue trend" in " ".join(trends.keys()).lower() and "improving" in trends.get("Quarterly Revenue Trend", "").lower():
+        score += 1
+    if "Quarterly Operating Income Trend" in trends and "deteriorating" in trends["Quarterly Operating Income Trend"].lower():
+        score -= 1
+    if "Quarterly FCF Trend" in trends and "improving" in trends["Quarterly FCF Trend"].lower():
+        score += 1
+    if "Quarterly FCF Trend" in trends and "deteriorating" in trends["Quarterly FCF Trend"].lower():
+        score -= 1
+    if "Share Count Trend" in trends and "deteriorating" in trends["Share Count Trend"].lower():
+        score -= 1
+    if "Last EPS Surprise" in v21_data.get("earnings_intel", {}) and "-" in v21_data["earnings_intel"]["Last EPS Surprise"]:
+        score -= 1
     return clamp_score(score)
 
 
@@ -511,7 +794,7 @@ def score_valuation_stretch(data: dict[str, Any]) -> int:
     return clamp_score(score)
 
 
-def score_catalyst_proximity(data: dict[str, Any]) -> int:
+def score_catalyst_proximity(data: dict[str, Any], v21_data: dict[str, Any]) -> int:
     score = 5
     if abs(number_or_none(data.get("return_5d")) or 0) > 8:
         score += 1
@@ -521,10 +804,24 @@ def score_catalyst_proximity(data: dict[str, Any]) -> int:
         score += 1
     if number_or_none(data.get("operating_margins")) and number_or_none(data.get("operating_margins")) < -0.3:
         score += 1
+    earnings = v21_data.get("earnings_intel", {})
+    days = int_or_none(earnings.get("Days To Earnings"))
+    if days is not None:
+        if 0 <= days <= 30:
+            score += 3
+        elif 31 <= days <= 75:
+            score += 1
+        elif days < 0:
+            score -= 1
+    if earnings.get("Last EPS Surprise") and "-" in earnings.get("Last EPS Surprise", ""):
+        score += 1
+    narrative = v21_data.get("narrative_heat", {})
+    if narrative.get("Narrative Heat") == "High":
+        score += 1
     return clamp_score(score)
 
 
-def score_dilution_risk(data: dict[str, Any]) -> int:
+def score_dilution_risk(data: dict[str, Any], v21_data: dict[str, Any]) -> int:
     score = 3
     op_margin = number_or_none(data.get("operating_margins"))
     profit_margin = number_or_none(data.get("profit_margins"))
@@ -548,6 +845,71 @@ def score_dilution_risk(data: dict[str, Any]) -> int:
             score -= 2
         elif runway_years and runway_years < 1:
             score += 2
+    trends = v21_data.get("financial_trends", {})
+    issuance = parse_first_number(trends.get("Recent Capital Stock Issuance"))
+    share_trend = trends.get("Share Count Trend", "")
+    if issuance and issuance > 10_000_000:
+        score += 2
+    if "Share Count Trend" in trends and ("improving" in share_trend.lower() or "deteriorating" in share_trend.lower()):
+        pct = parse_percent_from_text(share_trend)
+        if pct and abs(pct) > 10:
+            score += 2
+    return clamp_score(score)
+
+
+def score_ownership_signal(v21_data: dict[str, Any]) -> int:
+    ownership = v21_data.get("ownership_intel", {})
+    if not ownership:
+        return 5
+
+    score = 5
+    institutions = parse_percent_from_text(ownership.get("Institutions Held"))
+    insiders = parse_percent_from_text(ownership.get("Insiders Held"))
+    rec_mix = ownership.get("Analyst Recommendation Mix", "")
+
+    if institutions is not None:
+        if institutions >= 40:
+            score += 1
+        if institutions >= 60:
+            score += 1
+        if institutions < 15:
+            score -= 1
+    if insiders is not None:
+        if insiders >= 5:
+            score += 1
+        if insiders >= 15:
+            score += 1
+
+    buy_count = parse_named_count(rec_mix, "strongBuy") + parse_named_count(rec_mix, "buy")
+    bearish_count = parse_named_count(rec_mix, "sell") + parse_named_count(rec_mix, "strongSell")
+    hold_count = parse_named_count(rec_mix, "hold")
+    if buy_count > hold_count + bearish_count and buy_count > 0:
+        score += 1
+    if bearish_count > buy_count and bearish_count > 0:
+        score -= 1
+
+    insider_activity = ownership.get("Recent Insider Transaction Types", "").lower()
+    if any(term in insider_activity for term in ["sale", "sell", "disposition"]):
+        score -= 1
+    if any(term in insider_activity for term in ["purchase", "buy", "acquisition"]):
+        score += 1
+    return clamp_score(score)
+
+
+def score_narrative_heat(v21_data: dict[str, Any]) -> int:
+    narrative = v21_data.get("narrative_heat", {})
+    heat = narrative.get("Narrative Heat")
+    if heat == "High":
+        score = 9
+    elif heat == "Medium":
+        score = 6
+    elif heat == "Low":
+        score = 3
+    else:
+        score = 5
+    themes = narrative.get("Narrative Themes", "")
+    if "Momentum Coverage" in themes:
+        score += 1
     return clamp_score(score)
 
 
@@ -568,9 +930,13 @@ def score_squeeze_risk(data: dict[str, Any]) -> int:
 
 def score_asymmetry(scores: dict[str, int], data: dict[str, Any]) -> int:
     score = 5
-    if scores["Fundamental Validation"] >= 7:
+    if scores["Fundamental Trend"] >= 7:
         score += 2
-    if scores["Catalyst Proximity"] >= 7:
+    if scores["Event Risk"] >= 7:
+        score += 1
+    if scores["Ownership Signal"] >= 7:
+        score += 1
+    if scores["Narrative Heat"] >= 7 and scores["Momentum"] >= 6:
         score += 1
     if scores["Momentum"] >= 7 and scores["Exhaustion Risk"] <= 6:
         score += 1
@@ -580,10 +946,12 @@ def score_asymmetry(scores: dict[str, int], data: dict[str, Any]) -> int:
         score -= 1
     if scores["Exhaustion Risk"] >= 8:
         score -= 2
+    if scores["Narrative Heat"] >= 8 and scores["Exhaustion Risk"] >= 7:
+        score -= 1
     return clamp_score(score)
 
 
-def build_evidence_flags(scores: dict[str, int], data: dict[str, Any]) -> list[str]:
+def build_evidence_flags(scores: dict[str, int], data: dict[str, Any], v21_data: dict[str, Any]) -> list[str]:
     flags: list[str] = []
     r1 = number_or_none(data.get("return_1m"))
     r3 = number_or_none(data.get("return_3m"))
@@ -597,10 +965,18 @@ def build_evidence_flags(scores: dict[str, int], data: dict[str, Any]) -> list[s
         flags.append("move is statistically extended")
     if scores["Valuation Stretch"] >= 7:
         flags.append("valuation already prices strong execution")
-    if scores["Fundamental Validation"] <= 4:
+    if scores["Fundamental Trend"] <= 4:
         flags.append("fundamentals do not yet validate the tape")
+    if scores["Event Risk"] >= 7:
+        flags.append("near-term event risk can reprice the setup")
     if scores["Dilution Risk"] >= 7:
         flags.append("losses plus rally create dilution/financing risk")
+    if scores["Ownership Signal"] >= 7:
+        flags.append("ownership/analyst signal is supportive")
+    elif scores["Ownership Signal"] <= 4:
+        flags.append("ownership/analyst signal is weak or conflicted")
+    if scores["Narrative Heat"] >= 8:
+        flags.append("narrative heat is high; watch story-stock crowding")
     runway = cash_runway_years(data)
     if runway is not None and runway > 3:
         flags.append(f"cash runway appears strong at roughly {runway:,.1f} years of current FCF burn")
@@ -612,6 +988,28 @@ def build_evidence_flags(scores: dict[str, int], data: dict[str, Any]) -> list[s
         flags.append("asymmetry unfavorable until next confirming data point")
     elif scores["Asymmetry"] >= 7:
         flags.append("asymmetry favorable if catalyst confirms")
+
+    earnings = v21_data.get("earnings_intel", {})
+    days = earnings.get("Days To Earnings")
+    if days not in {None, "", "Unknown"}:
+        flags.append(f"earnings timing: {days} days")
+    if earnings.get("Last EPS Surprise"):
+        flags.append(f"last EPS surprise: {earnings['Last EPS Surprise']}")
+
+    trends = v21_data.get("financial_trends", {})
+    for key in ["Quarterly Revenue Trend", "Quarterly Operating Income Trend", "Quarterly FCF Trend", "Share Count Trend"]:
+        if trends.get(key):
+            flags.append(f"{key.lower()}: {trends[key]}")
+
+    ownership = v21_data.get("ownership_intel", {})
+    if ownership.get("Institutions Held"):
+        flags.append(f"institutional ownership: {ownership['Institutions Held']}")
+    if ownership.get("Recent Insider Transaction Types"):
+        flags.append(f"recent insider actions: {ownership['Recent Insider Transaction Types']}")
+
+    narrative = v21_data.get("narrative_heat", {})
+    if narrative.get("Narrative Heat"):
+        flags.append(f"narrative heat: {narrative['Narrative Heat']} ({narrative.get('Narrative Themes', 'themes unclear')})")
     return flags
 
 
@@ -627,7 +1025,12 @@ def cash_runway_years(data: dict[str, Any]) -> float | None:
 
 
 def build_trade_verdict(scores: dict[str, int], data: dict[str, Any], flags: list[str]) -> dict[str, str]:
-    if scores["Asymmetry"] >= 7 and scores["Exhaustion Risk"] <= 6 and scores["Valuation Stretch"] <= 6:
+    if (
+        scores["Asymmetry"] >= 7
+        and scores["Exhaustion Risk"] <= 6
+        and scores["Valuation Stretch"] <= 6
+        and scores["Fundamental Trend"] >= 6
+    ):
         verdict = "CHASEABLE"
         action = "PROCEED"
         bias = "LONG"
@@ -637,16 +1040,21 @@ def build_trade_verdict(scores: dict[str, int], data: dict[str, Any], flags: lis
         action = "HOLD"
         bias = "WATCHLIST"
         trade_type = "EXTENDED MOMENTUM"
-    elif scores["Valuation Stretch"] >= 8 and scores["Fundamental Validation"] <= 5:
+    elif scores["Valuation Stretch"] >= 8 and scores["Fundamental Trend"] <= 5:
         verdict = "AVOID CHASING"
         action = "AVOID"
         bias = "AVOID"
         trade_type = "PRICED FOR PERFECTION"
-    elif scores["Catalyst Proximity"] >= 7:
+    elif scores["Event Risk"] >= 7 and scores["Asymmetry"] >= 4:
         verdict = "EVENT WATCH"
         action = "HOLD"
         bias = "WATCHLIST"
         trade_type = "WAIT FOR CATALYST"
+    elif scores["Narrative Heat"] >= 8 and scores["Fundamental Trend"] <= 6:
+        verdict = "NARRATIVE WATCH"
+        action = "HOLD"
+        bias = "WATCHLIST"
+        trade_type = "STORY STOCK WITHOUT FULL VALIDATION"
     else:
         verdict = "WATCHLIST"
         action = "HOLD"
@@ -697,10 +1105,28 @@ def volume_surge_ratio(data: dict[str, Any]) -> float | None:
     return avg20 / avg
 
 
-def format_engine_evidence(scores: dict[str, int], verdict: dict[str, str], flags: list[str]) -> str:
+def format_engine_evidence(
+    scores: dict[str, int],
+    verdict: dict[str, str],
+    flags: list[str],
+    v21_data: dict[str, Any] | None = None,
+) -> str:
     score_lines = "\n".join(f"{name}: {score}/10" for name, score in scores.items())
     verdict_lines = "\n".join(f"{name}: {value}" for name, value in verdict.items())
     flag_lines = "\n".join(f"- {flag}" for flag in flags) if flags else "- No decisive deterministic flags."
+    v21_lines: list[str] = []
+    if v21_data:
+        sections = {
+            "EARNINGS INTELLIGENCE": v21_data.get("earnings_intel", {}),
+            "QUARTERLY FINANCIAL TRENDS": v21_data.get("financial_trends", {}),
+            "OWNERSHIP / INSIDER SIGNALS": v21_data.get("ownership_intel", {}),
+            "NEWS / NARRATIVE HEAT": v21_data.get("narrative_heat", {}),
+        }
+        for title, values in sections.items():
+            if values:
+                v21_lines.append(title)
+                v21_lines.extend(f"{key}: {value}" for key, value in values.items())
+                v21_lines.append("")
     return f"""DETERMINISTIC ENGINE SCORES
 {score_lines}
 
@@ -708,7 +1134,10 @@ DETERMINISTIC TRADE VERDICT
 {verdict_lines}
 
 EVIDENCE FLAGS
-{flag_lines}"""
+{flag_lines}
+
+V2.1 DATA COMPLETION LAYER
+{chr(10).join(v21_lines).strip() or "No additional V2.1 data available."}"""
 
 
 def build_quick_read(data: dict[str, Any]) -> str:
@@ -740,6 +1169,38 @@ def format_percent_ratio(value: Any) -> str:
 
 def number_or_none(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def int_or_none(value: Any) -> int | None:
+    try:
+        if value in {None, "", "Unknown", "N/A"}:
+            return None
+        return int(float(str(value).replace(",", "").replace("%", "").strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_first_number(text: str | None) -> float | None:
+    if not text:
+        return None
+    match = re.search(r"-?\d[\d,]*(?:\.\d+)?", str(text))
+    if not match:
+        return None
+    return float(match.group(0).replace(",", ""))
+
+
+def parse_percent_from_text(text: str | None) -> float | None:
+    if not text:
+        return None
+    match = re.search(r"(-?\d+(?:\.\d+)?)\s*%", str(text))
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def parse_named_count(text: str, name: str) -> int:
+    match = re.search(rf"\b{re.escape(name)}\s+(\d+)", text, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else 0
 
 
 def format_market_value(value: Any) -> str:
@@ -817,6 +1278,8 @@ def load_cache(ticker: str) -> DDResult | None:
             }
         if "evidence_flags" not in data:
             data["evidence_flags"] = []
+        for key in ["earnings_intel", "financial_trends", "ownership_intel", "narrative_heat"]:
+            data.setdefault(key, {})
         return DDResult(**data)
     except (json.JSONDecodeError, TypeError, OSError):
         return None
@@ -1024,10 +1487,11 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     client = get_openai_client()
     model = get_model()
     market_data = fetch_market_data(ticker)
+    v21_data = fetch_v21_data(ticker) if not market_data.get("error") else {}
     market_data_text = format_market_data(market_data)
     market_snapshot = build_market_snapshot(market_data)
-    engine_scores, trade_verdict, evidence_flags = build_v2_evidence_engine(market_data)
-    engine_evidence = format_engine_evidence(engine_scores, trade_verdict, evidence_flags)
+    engine_scores, trade_verdict, evidence_flags = build_v2_evidence_engine(market_data, v21_data)
+    engine_evidence = format_engine_evidence(engine_scores, trade_verdict, evidence_flags, v21_data)
     if market_data.get("error"):
         st.warning(market_data["error"])
         raise UserFacingError(
@@ -1092,6 +1556,10 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         market_snapshot=market_snapshot,
         trade_verdict=trade_verdict,
         evidence_flags=evidence_flags,
+        earnings_intel=v21_data.get("earnings_intel", {}),
+        financial_trends=v21_data.get("financial_trends", {}),
+        ownership_intel=v21_data.get("ownership_intel", {}),
+        narrative_heat=v21_data.get("narrative_heat", {}),
     )
     save_cache(result)
     return result
@@ -1260,6 +1728,10 @@ def export_markdown(result: DDResult) -> str:
     market = "\n".join(f"- **{name}:** {value}" for name, value in result.market_snapshot.items())
     verdict = "\n".join(f"- **{name}:** {value}" for name, value in result.trade_verdict.items())
     flags = "\n".join(f"- {flag}" for flag in result.evidence_flags)
+    earnings = markdown_dict(result.earnings_intel)
+    trends = markdown_dict(result.financial_trends)
+    ownership = markdown_dict(result.ownership_intel)
+    narrative = markdown_dict(result.narrative_heat)
     company = f"\n**Company:** {result.company_name}" if result.company_name else ""
     return f"""# {APP_TITLE}
 
@@ -1277,13 +1749,29 @@ def export_markdown(result: DDResult) -> str:
 
 {market}
 
-## V2 Trade Verdict
+## V2.1 Trade Verdict
 
 {verdict}
 
 ## Evidence Flags
 
 {flags}
+
+## Earnings Intelligence
+
+{earnings}
+
+## Quarterly Financial Trends
+
+{trends}
+
+## Ownership / Insider Signals
+
+{ownership}
+
+## News / Narrative Heat
+
+{narrative}
 
 ## Decision Card
 
@@ -1303,8 +1791,14 @@ def export_markdown(result: DDResult) -> str:
 """
 
 
+def markdown_dict(values: dict[str, str]) -> str:
+    if not values:
+        return "- No data available."
+    return "\n".join(f"- **{name}:** {value}" for name, value in values.items())
+
+
 def render_dashboard(result: DDResult) -> None:
-    st.subheader("V2 Trade Verdict")
+    st.subheader("V2.1 Trade Verdict")
     verdict = result.trade_verdict
     verdict_cols = st.columns([1.2, 1, 1.2, 1.6])
     verdict_cols[0].metric("Verdict", verdict.get("Verdict", result.recommendation))
@@ -1325,6 +1819,11 @@ def render_dashboard(result: DDResult) -> None:
         for index, (label, value) in enumerate(result.market_snapshot.items()):
             snap_cols[index % len(snap_cols)].metric(label, value)
 
+    render_info_grid("Earnings Intelligence", result.earnings_intel)
+    render_info_grid("Quarterly Financial Trends", result.financial_trends)
+    render_info_grid("Ownership / Insider Signals", result.ownership_intel)
+    render_info_grid("News / Narrative Heat", result.narrative_heat)
+
     st.subheader("Decision Card")
     card = result.decision_card
     top_cols = st.columns([1, 1, 2, 2])
@@ -1343,7 +1842,7 @@ def render_dashboard(result: DDResult) -> None:
             f"{card.get('Bear Probability', 'Not specified')}"
         )
 
-    st.subheader("V2 Evidence Scores")
+    st.subheader("V2.1 Evidence Scores")
     cols = st.columns(4)
     for index, name in enumerate(SCORE_NAMES):
         cols[index % len(cols)].metric(name, f"{result.dashboard_scores.get(name, 0)}/10")
@@ -1355,6 +1854,15 @@ def render_dashboard(result: DDResult) -> None:
         st.error(f"Recommendation: {rec} - {result.recommendation_reason}")
     else:
         st.warning(f"Recommendation: {rec} - {result.recommendation_reason}")
+
+
+def render_info_grid(title: str, values: dict[str, str]) -> None:
+    if not values:
+        return
+    st.subheader(title)
+    with st.container(border=True):
+        for label, value in values.items():
+            st.markdown(f"**{label}:** {value}")
 
 
 def render_step(title: str, content: str) -> None:
