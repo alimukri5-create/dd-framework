@@ -389,7 +389,7 @@ def extract_financial_trends(asset: Any) -> dict[str, str]:
         balance = asset.quarterly_balance_sheet
         trends.update(
             {
-                "Share Count Trend": trend_from_statement(balance, ["Ordinary Shares Number", "Share Issued"]),
+                "Share Count Trend": share_count_trend_from_statement(balance, ["Ordinary Shares Number", "Share Issued"]),
                 "Recent Total Debt": latest_statement_value(balance, ["Total Debt"]),
                 "Recent Working Capital": latest_statement_value(balance, ["Working Capital"]),
             }
@@ -500,6 +500,26 @@ def trend_from_statement(frame: Any, labels: list[str]) -> str:
     delta = latest - prior
     pct = (delta / abs(prior) * 100) if prior else None
     direction = "improving" if delta > 0 else "deteriorating" if delta < 0 else "flat"
+    pct_text = f", {pct:,.1f}% QoQ" if pct is not None else ""
+    return f"{format_market_value(latest)} vs {format_market_value(prior)} prior ({direction}{pct_text})"
+
+
+def share_count_trend_from_statement(frame: Any, labels: list[str]) -> str:
+    if frame is None or frame.empty:
+        return "N/A"
+    series = statement_series(frame, labels)
+    if series is None or len(series) < 2:
+        return "N/A"
+    latest = float(series.iloc[0])
+    prior = float(series.iloc[1])
+    delta = latest - prior
+    pct = (delta / abs(prior) * 100) if prior else None
+    if delta > 0:
+        direction = "dilutive increase"
+    elif delta < 0:
+        direction = "share count reduction"
+    else:
+        direction = "flat"
     pct_text = f", {pct:,.1f}% QoQ" if pct is not None else ""
     return f"{format_market_value(latest)} vs {format_market_value(prior)} prior ({direction}{pct_text})"
 
@@ -886,7 +906,7 @@ def fetch_sec_filing_signals(ticker: str) -> dict[str, str]:
         dates = recent.get("filingDate", [])[:40]
         docs = recent.get("primaryDocument", [])[:40]
         rows = list(zip(forms, dates, docs))
-        risky_forms = [row for row in rows if row[0] in {"S-3", "S-3ASR", "424B5", "424B3", "FWP"}]
+        risky_forms = [row for row in rows if row[0] in {"S-3", "S-3/A", "S-3ASR", "424B5", "424B3", "FWP"}]
         eight_ks = [row for row in rows if row[0] == "8-K"]
         signals: dict[str, str] = {
             "SEC CIK": cik,
@@ -895,7 +915,7 @@ def fetch_sec_filing_signals(ticker: str) -> dict[str, str]:
         if risky_forms:
             signals["Shelf/Offering Overhang"] = "; ".join(f"{form} {date}" for form, date, _ in risky_forms[:5])
         else:
-            signals["Shelf/Offering Overhang"] = "No S-3/424B/FWP forms found in latest 40 SEC filings."
+            signals["Shelf/Offering Overhang"] = "No S-3/S-3A/424B/FWP forms found in latest 40 SEC filings."
         if eight_ks:
             signals["Recent 8-K Activity"] = f"{len(eight_ks)} recent 8-K filings in latest 40 filings."
         signals["SEC Source"] = "SEC submissions JSON"
@@ -1078,7 +1098,7 @@ def score_fundamental_validation(data: dict[str, Any], v21_data: dict[str, Any])
         score += 1
     if "Quarterly FCF Trend" in trends and "deteriorating" in trends["Quarterly FCF Trend"].lower():
         score -= 1
-    if "Share Count Trend" in trends and "deteriorating" in trends["Share Count Trend"].lower():
+    if "Share Count Trend" in trends and "dilutive increase" in trends["Share Count Trend"].lower():
         score -= 1
     if "Last EPS Surprise" in v21_data.get("earnings_intel", {}) and "-" in v21_data["earnings_intel"]["Last EPS Surprise"]:
         score -= 1
@@ -1160,10 +1180,12 @@ def score_dilution_risk(data: dict[str, Any], v21_data: dict[str, Any]) -> int:
     share_trend = trends.get("Share Count Trend", "")
     if issuance and issuance > 10_000_000:
         score += 2
-    if "Share Count Trend" in trends and ("improving" in share_trend.lower() or "deteriorating" in share_trend.lower()):
+    if "Share Count Trend" in trends and (
+        "dilutive increase" in share_trend.lower() or "share count reduction" in share_trend.lower()
+    ):
         pct = parse_percent_from_text(share_trend)
         if pct and abs(pct) > 10:
-            score += 2
+            score += 2 if "dilutive increase" in share_trend.lower() else -1
     return clamp_score(score)
 
 
