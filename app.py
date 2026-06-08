@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +67,10 @@ class DDResult:
     financial_trends: dict[str, str]
     ownership_intel: dict[str, str]
     narrative_heat: dict[str, str]
+    expectations_baseline: dict[str, str]
+    payoff_distribution: dict[str, str]
+    unconventional_signals: dict[str, str]
+    asymmetry_assessment: dict[str, str]
 
 
 class UserFacingError(Exception):
@@ -219,6 +223,12 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
             "trailing_pe": info.get("trailingPE"),
             "forward_pe": info.get("forwardPE"),
             "beta": info.get("beta"),
+            "target_mean_price": info.get("targetMeanPrice"),
+            "target_high_price": info.get("targetHighPrice"),
+            "target_low_price": info.get("targetLowPrice"),
+            "recommendation_mean": info.get("recommendationMean"),
+            "recommendation_key": info.get("recommendationKey"),
+            "number_of_analyst_opinions": info.get("numberOfAnalystOpinions"),
         }
     )
 
@@ -618,6 +628,12 @@ def format_market_data(data: dict[str, Any]) -> str:
         "trailing_pe": "Trailing P/E",
         "forward_pe": "Forward P/E",
         "beta": "Beta",
+        "target_mean_price": "Analyst Target Mean",
+        "target_high_price": "Analyst Target High",
+        "target_low_price": "Analyst Target Low",
+        "recommendation_mean": "Recommendation Mean",
+        "recommendation_key": "Recommendation Key",
+        "number_of_analyst_opinions": "Analyst Opinion Count",
     }
     lines = [
         f"MARKET DATA SOURCE: {data.get('source')}",
@@ -659,6 +675,300 @@ def build_market_snapshot(data: dict[str, Any]) -> dict[str, str]:
     snapshot["Volatility"] = f"Beta {format_market_value(data.get('beta') or 'N/A')}"
     snapshot["Quick Read"] = build_quick_read(data)
     return snapshot
+
+
+def build_v3_edge_layer(
+    ticker: str,
+    data: dict[str, Any],
+    v21_data: dict[str, Any],
+    scores: dict[str, int],
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]]:
+    """Build honest expectations/payoff diagnostics before claiming asymmetry."""
+    expectations = build_expectations_baseline(ticker, data, v21_data)
+    payoff = build_payoff_distribution(data, expectations)
+    unconventional = build_unconventional_signals(ticker, data, v21_data)
+    asymmetry = build_true_asymmetry_assessment(scores, expectations, payoff, unconventional)
+    return expectations, payoff, unconventional, asymmetry
+
+
+def build_expectations_baseline(ticker: str, data: dict[str, Any], v21_data: dict[str, Any]) -> dict[str, str]:
+    baseline: dict[str, str] = {
+        "Baseline Rule": "No asymmetry claim without market-implied expectations and payoff math.",
+        "Price Baseline": format_market_value(data.get("current_price") or data.get("last_close") or "N/A"),
+    }
+
+    price = number_or_none(data.get("current_price") or data.get("last_close"))
+    target = number_or_none(data.get("target_mean_price"))
+    target_high = number_or_none(data.get("target_high_price"))
+    target_low = number_or_none(data.get("target_low_price"))
+    if price and target:
+        baseline["Sell-Side Mean Target Gap"] = f"{percent_change(target, price):,.1f}%"
+    if price and target_high and target_low:
+        baseline["Sell-Side Target Range"] = (
+            f"{format_market_value(target_low)} to {format_market_value(target_high)} "
+            f"({percent_change(target_low, price):,.1f}% / {percent_change(target_high, price):,.1f}%)"
+        )
+    if data.get("recommendation_key"):
+        baseline["Consensus Recommendation"] = str(data.get("recommendation_key")).upper()
+    if data.get("number_of_analyst_opinions") is not None:
+        baseline["Analyst Count"] = format_market_value(data.get("number_of_analyst_opinions"))
+
+    options = fetch_options_expectations(ticker, price, v21_data)
+    baseline.update(options)
+
+    if not any(key in baseline for key in ["Options Implied Move", "Sell-Side Mean Target Gap"]):
+        baseline["Expectations Status"] = "Weak: no options-implied move or analyst target baseline available."
+    elif "Options Implied Move" not in baseline:
+        baseline["Expectations Status"] = "Partial: analyst baseline available, options-implied move missing."
+    elif "Sell-Side Mean Target Gap" not in baseline:
+        baseline["Expectations Status"] = "Partial: options baseline available, sell-side target missing."
+    else:
+        baseline["Expectations Status"] = "Usable: options and sell-side baselines available."
+    return baseline
+
+
+def fetch_options_expectations(ticker: str, price: float | None, v21_data: dict[str, Any]) -> dict[str, str]:
+    if not price or price <= 0:
+        return {"Options Status": "Unavailable: current price missing."}
+    try:
+        clear_proxy_env_for_market_data()
+        asset = yf.Ticker(ticker)
+        expiries = list(asset.options or [])
+        if not expiries:
+            return {"Options Status": "Unavailable: no listed options found via yfinance."}
+        expiry = choose_options_expiry(expiries, v21_data)
+        chain = asset.option_chain(expiry)
+        call = closest_strike_row(chain.calls, price)
+        put = closest_strike_row(chain.puts, price)
+        if call is None or put is None:
+            return {"Options Status": "Unavailable: no ATM call/put pair found."}
+        call_price = option_mid_or_last(call)
+        put_price = option_mid_or_last(put)
+        if call_price is None or put_price is None:
+            return {"Options Status": "Unavailable: ATM option prices missing."}
+        implied_move = (call_price + put_price) / price * 100
+        strike = call.get("strike") if call.get("strike") is not None else price
+        return {
+            "Options Expiry Used": str(expiry),
+            "ATM Strike Used": format_market_value(strike),
+            "ATM Straddle Price": format_market_value(call_price + put_price),
+            "Options Implied Move": f"+/- {implied_move:,.1f}%",
+            "Options Status": "Usable: nearest relevant ATM straddle used as market-implied event/risk baseline.",
+        }
+    except Exception as exc:
+        return {"Options Status": f"Unavailable: {exc}"}
+
+
+def choose_options_expiry(expiries: list[str], v21_data: dict[str, Any]) -> str:
+    days = int_or_none(v21_data.get("earnings_intel", {}).get("Days To Earnings"))
+    if days is None or days < 0:
+        return expiries[0]
+    today = datetime.now(timezone.utc).date()
+    target_date = today + timedelta(days=days)
+    for expiry in expiries:
+        try:
+            if datetime.fromisoformat(expiry).date() >= target_date:
+                return expiry
+        except ValueError:
+            continue
+    return expiries[0]
+
+
+def closest_strike_row(frame: Any, price: float) -> dict[str, Any] | None:
+    try:
+        if frame is None or frame.empty or "strike" not in frame:
+            return None
+        closest_index = (frame["strike"] - price).abs().idxmin()
+        return frame.loc[closest_index].to_dict()
+    except Exception:
+        return None
+
+
+def option_mid_or_last(row: dict[str, Any]) -> float | None:
+    bid = number_or_none(row.get("bid"))
+    ask = number_or_none(row.get("ask"))
+    last = number_or_none(row.get("lastPrice"))
+    if bid is not None and ask is not None and bid > 0 and ask > 0 and ask >= bid:
+        return (bid + ask) / 2
+    if last is not None and last > 0:
+        return last
+    return None
+
+
+def build_payoff_distribution(data: dict[str, Any], expectations: dict[str, str]) -> dict[str, str]:
+    price = number_or_none(data.get("current_price") or data.get("last_close"))
+    if not price or price <= 0:
+        return {"Payoff Status": "Unavailable: current price missing."}
+
+    target = number_or_none(data.get("target_mean_price"))
+    target_high = number_or_none(data.get("target_high_price"))
+    target_low = number_or_none(data.get("target_low_price"))
+    high_52w = number_or_none(data.get("fifty_two_week_high"))
+    low_52w = number_or_none(data.get("fifty_two_week_low"))
+    cash = number_or_none(data.get("total_cash"))
+    shares = number_or_none(data.get("shares_outstanding") or data.get("implied_shares_outstanding"))
+    cash_per_share = cash / shares if cash and shares else None
+    implied_move = parse_percent_from_text(expectations.get("Options Implied Move"))
+
+    bull_price = first_valid_number(
+        [
+            target_high if target_high and target_high > price else None,
+            high_52w if high_52w and high_52w > price else None,
+            price * (1 + (implied_move or 20) / 100),
+        ]
+    )
+    base_price = first_valid_number([target, price])
+    bear_floor = first_valid_number(
+        [
+            target_low if target_low and target_low < price else None,
+            low_52w if low_52w and low_52w < price else None,
+            cash_per_share if cash_per_share and cash_per_share < price else None,
+            price * 0.8,
+        ]
+    )
+    bear_price = max(cash_per_share or 0, bear_floor) if bear_floor else price * 0.8
+
+    upside = percent_change(bull_price, price) if bull_price else None
+    base = percent_change(base_price, price) if base_price else None
+    downside = percent_change(bear_price, price) if bear_price else None
+    payoff: dict[str, str] = {
+        "Current Price": format_market_value(price),
+        "Bull Case Price": format_market_value(bull_price) if bull_price else "N/A",
+        "Base Case Price": format_market_value(base_price) if base_price else "N/A",
+        "Bear Case Floor": format_market_value(bear_price),
+        "Bull / Base / Bear Move": (
+            f"{format_signed_percent(upside)} / {format_signed_percent(base)} / {format_signed_percent(downside)}"
+        ),
+    }
+    if cash_per_share:
+        payoff["Cash Per Share Floor"] = format_market_value(cash_per_share)
+    if upside is not None and downside is not None and downside < 0:
+        payoff["Upside/Downside Ratio"] = f"{upside / abs(downside):,.2f}x"
+    else:
+        payoff["Upside/Downside Ratio"] = "N/A"
+    payoff["Payoff Status"] = "Heuristic: uses listed options, sell-side targets, 52-week range, and cash/share when available."
+    return payoff
+
+
+def build_unconventional_signals(ticker: str, data: dict[str, Any], v21_data: dict[str, Any]) -> dict[str, str]:
+    signals = fetch_sec_filing_signals(ticker)
+    insider_text = v21_data.get("ownership_intel", {}).get("Recent Insider Transaction Types", "")
+    if insider_text:
+        signals["Insider Cluster Signal"] = classify_insider_activity(insider_text)
+    narrative = v21_data.get("narrative_heat", {})
+    if narrative.get("Narrative Heat"):
+        signals["Narrative Acceleration Caveat"] = (
+            "Yahoo headline heat only; not true alt-data. Treat as crowding/attention, not edge."
+        )
+    if not signals:
+        signals["Unconventional Status"] = "None found in the free-data layer."
+    return signals
+
+
+def fetch_sec_filing_signals(ticker: str) -> dict[str, str]:
+    try:
+        clear_proxy_env_for_market_data()
+        headers = {"User-Agent": "DDFramework/1.0 research-app@example.com"}
+        mapping_response = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=15)
+        mapping_response.raise_for_status()
+        mapping = mapping_response.json()
+        match = next(
+            (item for item in mapping.values() if str(item.get("ticker", "")).upper() == ticker.upper()),
+            None,
+        )
+        if not match:
+            return {"SEC Status": "No SEC company match found for ticker."}
+        cik = str(match["cik_str"]).zfill(10)
+        submissions = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=headers, timeout=15)
+        submissions.raise_for_status()
+        recent = submissions.json().get("filings", {}).get("recent", {})
+        forms = recent.get("form", [])[:40]
+        dates = recent.get("filingDate", [])[:40]
+        docs = recent.get("primaryDocument", [])[:40]
+        rows = list(zip(forms, dates, docs))
+        risky_forms = [row for row in rows if row[0] in {"S-3", "S-3ASR", "424B5", "424B3", "FWP"}]
+        eight_ks = [row for row in rows if row[0] == "8-K"]
+        signals: dict[str, str] = {
+            "SEC CIK": cik,
+            "Recent SEC Filings": "; ".join(f"{form} {date}" for form, date, _ in rows[:6]) or "N/A",
+        }
+        if risky_forms:
+            signals["Shelf/Offering Overhang"] = "; ".join(f"{form} {date}" for form, date, _ in risky_forms[:5])
+        else:
+            signals["Shelf/Offering Overhang"] = "No S-3/424B/FWP forms found in latest 40 SEC filings."
+        if eight_ks:
+            signals["Recent 8-K Activity"] = f"{len(eight_ks)} recent 8-K filings in latest 40 filings."
+        signals["SEC Source"] = "SEC submissions JSON"
+        return signals
+    except Exception as exc:
+        return {"SEC Status": f"Unavailable: {exc}"}
+
+
+def classify_insider_activity(text: str) -> str:
+    lower = text.lower()
+    sell_count = sum(lower.count(term) for term in ["sale", "sell", "disposition"])
+    buy_count = sum(lower.count(term) for term in ["purchase", "buy", "acquisition"])
+    if buy_count >= 2 and buy_count > sell_count:
+        return "Potential insider-buying cluster; verify transaction codes manually."
+    if sell_count >= 2 and sell_count > buy_count:
+        return "Insider-selling cluster risk; verify if sales are planned/10b5-1 before penalizing."
+    return "Mixed/unclear insider activity; not a standalone edge."
+
+
+def build_true_asymmetry_assessment(
+    scores: dict[str, int],
+    expectations: dict[str, str],
+    payoff: dict[str, str],
+    unconventional: dict[str, str],
+) -> dict[str, str]:
+    ratio = parse_first_number(payoff.get("Upside/Downside Ratio"))
+    has_expectations = "Options Implied Move" in expectations or "Sell-Side Mean Target Gap" in expectations
+    has_payoff = ratio is not None
+    shelf_text = unconventional.get("Shelf/Offering Overhang", "")
+    has_offering_overhang = bool(shelf_text and not shelf_text.lower().startswith("no "))
+    insider_signal = unconventional.get("Insider Cluster Signal", "")
+    has_positive_non_consensus = "Potential insider-buying cluster" in insider_signal
+    has_material_filing_activity = "Recent 8-K Activity" in unconventional
+    if not has_expectations:
+        status = "NOT ESTABLISHED"
+        reason = "No market-expectations baseline found."
+    elif not has_payoff:
+        status = "NOT ESTABLISHED"
+        reason = "Payoff distribution is incomplete."
+    elif ratio < 1.5:
+        status = "UNFAVORABLE"
+        reason = f"Upside/downside ratio is only {ratio:,.2f}x."
+    elif has_offering_overhang:
+        status = "TACTICAL ONLY"
+        reason = "Payoff skew is visible, but shelf/offering overhang blocks a clean asymmetric claim."
+    elif not (has_positive_non_consensus or has_material_filing_activity):
+        status = "UNPROVEN"
+        reason = "Payoff is visible, but no non-consensus/free-data signal was found."
+    elif scores.get("Dilution Risk", 5) >= 8 or scores.get("Exhaustion Risk", 5) >= 8:
+        status = "TACTICAL ONLY"
+        reason = "Payoff exists, but dilution/exhaustion risk blocks a clean asymmetric claim."
+    else:
+        status = "POTENTIALLY ASYMMETRIC"
+        reason = "Expectations baseline, payoff skew, and at least one non-consensus signal are present."
+    return {
+        "True Asymmetry Status": status,
+        "Reason": reason,
+        "Required Standard": "Market baseline + payoff distribution + non-consensus evidence.",
+        "Calibration Status": "Uncalibrated: use as a checklist until historical forward-return validation exists.",
+    }
+
+
+def apply_true_asymmetry_guard(verdict: dict[str, str], asymmetry: dict[str, str]) -> dict[str, str]:
+    guarded = dict(verdict)
+    status = asymmetry.get("True Asymmetry Status", "NOT ESTABLISHED")
+    guarded["True Asymmetry"] = status
+    if guarded.get("Action") == "PROCEED" and status not in {"POTENTIALLY ASYMMETRIC"}:
+        guarded["Verdict"] = "DISCIPLINE PASS / EDGE UNPROVEN"
+        guarded["Action"] = "HOLD"
+        guarded["Bias"] = "WATCHLIST"
+        guarded["Trade Type"] = "DISCIPLINE PASS, NO PROVEN EDGE"
+        guarded["Why"] = f"{guarded.get('Why', '')}; true asymmetry {status.lower()}: {asymmetry.get('Reason', '')}".strip("; ")
+    return guarded
 
 
 def build_v2_evidence_engine(
@@ -985,9 +1295,9 @@ def build_evidence_flags(scores: dict[str, int], data: dict[str, Any], v21_data:
     if scores["Squeeze Risk"] >= 7:
         flags.append("short-interest setup can amplify moves")
     if scores["Asymmetry"] <= 4:
-        flags.append("asymmetry unfavorable until next confirming data point")
+        flags.append("discipline skew unfavorable until next confirming data point")
     elif scores["Asymmetry"] >= 7:
-        flags.append("asymmetry favorable if catalyst confirms")
+        flags.append("discipline skew favorable if catalyst confirms")
 
     earnings = v21_data.get("earnings_intel", {})
     days = earnings.get("Days To Earnings")
@@ -1091,10 +1401,10 @@ def build_invalidation_trigger(data: dict[str, Any]) -> str:
 
 def describe_asymmetry(scores: dict[str, int]) -> str:
     if scores["Asymmetry"] >= 7:
-        return "Positive skew if the next catalyst confirms fundamentals before valuation stretches further."
+        return "Discipline skew positive if the next catalyst confirms fundamentals before valuation stretches further."
     if scores["Asymmetry"] <= 4:
-        return "Negative skew: price/expectations look ahead of confirmed fundamentals."
-    return "Mixed skew: catalyst can move the stock, but confirmation is needed."
+        return "Discipline skew negative: price/expectations look ahead of confirmed fundamentals."
+    return "Mixed discipline skew: catalyst can move the stock, but confirmation is needed."
 
 
 def volume_surge_ratio(data: dict[str, Any]) -> float | None:
@@ -1110,6 +1420,10 @@ def format_engine_evidence(
     verdict: dict[str, str],
     flags: list[str],
     v21_data: dict[str, Any] | None = None,
+    expectations_baseline: dict[str, str] | None = None,
+    payoff_distribution: dict[str, str] | None = None,
+    unconventional_signals: dict[str, str] | None = None,
+    asymmetry_assessment: dict[str, str] | None = None,
 ) -> str:
     score_lines = "\n".join(f"{name}: {score}/10" for name, score in scores.items())
     verdict_lines = "\n".join(f"{name}: {value}" for name, value in verdict.items())
@@ -1127,6 +1441,18 @@ def format_engine_evidence(
                 v21_lines.append(title)
                 v21_lines.extend(f"{key}: {value}" for key, value in values.items())
                 v21_lines.append("")
+    v3_sections = {
+        "MARKET EXPECTATIONS BASELINE": expectations_baseline or {},
+        "PAYOFF DISTRIBUTION": payoff_distribution or {},
+        "UNCONVENTIONAL / LESS-COMMON SIGNALS": unconventional_signals or {},
+        "TRUE ASYMMETRY ASSESSMENT": asymmetry_assessment or {},
+    }
+    v3_lines: list[str] = []
+    for title, values in v3_sections.items():
+        if values:
+            v3_lines.append(title)
+            v3_lines.extend(f"{key}: {value}" for key, value in values.items())
+            v3_lines.append("")
     return f"""DETERMINISTIC ENGINE SCORES
 {score_lines}
 
@@ -1137,7 +1463,10 @@ EVIDENCE FLAGS
 {flag_lines}
 
 V2.1 DATA COMPLETION LAYER
-{chr(10).join(v21_lines).strip() or "No additional V2.1 data available."}"""
+{chr(10).join(v21_lines).strip() or "No additional V2.1 data available."}
+
+V3 EDGE / ASYMMETRY LAYER
+{chr(10).join(v3_lines).strip() or "No V3 edge diagnostics available."}"""
 
 
 def build_quick_read(data: dict[str, Any]) -> str:
@@ -1168,7 +1497,37 @@ def format_percent_ratio(value: Any) -> str:
 
 
 def number_or_none(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) else None
+    try:
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() in {"", "N/A", "Unknown"}:
+            return None
+        parsed = float(value)
+        if parsed != parsed:
+            return None
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def first_valid_number(values: list[Any]) -> float | None:
+    for value in values:
+        parsed = number_or_none(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def percent_change(target: float, base: float) -> float:
+    if base == 0:
+        return 0.0
+    return (target / base - 1) * 100
+
+
+def format_signed_percent(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:+,.1f}%"
 
 
 def int_or_none(value: Any) -> int | None:
@@ -1278,7 +1637,16 @@ def load_cache(ticker: str) -> DDResult | None:
             }
         if "evidence_flags" not in data:
             data["evidence_flags"] = []
-        for key in ["earnings_intel", "financial_trends", "ownership_intel", "narrative_heat"]:
+        for key in [
+            "earnings_intel",
+            "financial_trends",
+            "ownership_intel",
+            "narrative_heat",
+            "expectations_baseline",
+            "payoff_distribution",
+            "unconventional_signals",
+            "asymmetry_assessment",
+        ]:
             data.setdefault(key, {})
         return DDResult(**data)
     except (json.JSONDecodeError, TypeError, OSError):
@@ -1403,8 +1771,9 @@ Do not replace missing values with generic guesses.
 
 {market_data}
 
-Use this deterministic evidence engine as the trading frame. Do not ignore it or replace it with generic
-company commentary.
+Use this deterministic evidence engine as the trading frame. Treat the V2.1 scores as discipline checks,
+not calibrated alpha. Treat the V3 edge/asymmetry layer as the only place where asymmetry can be discussed.
+Do not ignore it or replace it with generic company commentary.
 
 {engine_evidence}
 
@@ -1416,7 +1785,7 @@ Return a concise decision briefing, not a company story:
    Do not list acquired, merged, delisted, or former companies as current competitors. If current competitor
    status is uncertain, say "competitor list needs verification" instead of guessing.
 5. SOURCE QUALITY: cite the market data source above and list missing data that would change the decision.
-6. CONFIDENCE: score each section 1-10.
+6. CONFIDENCE: score each section 1-10, but explicitly say whether confidence is data-grounded or heuristic.
 
 Format: 350-500 words. Use bullets. No background filler.
 """.strip()
@@ -1436,7 +1805,8 @@ Convert the company facts into investable/tradable economics:
    margin structure, or sector-equivalent economics. If a metric is irrelevant for the sector, say N/A.
 3. CATALYST MAP: next 3 likely catalysts, expected timing, and whether each is bullish/bearish/ambiguous.
 4. STALL MAP: what would make the thesis fail fast?
-5. FAST CHECK: what single data point should a trader verify before acting?
+5. EXPECTATIONS GAP: what does the options/target/payoff layer imply the market already prices?
+6. FAST CHECK: what single data point should a trader verify before acting?
 
 Format: 350-500 words. Use bullets/table style. Show confidence. No repeated company overview.
 """.strip()
@@ -1448,7 +1818,8 @@ Based on Steps 1-2: {step_1}
 
 {step_2}
 
-The deterministic evidence engine is the primary decision layer:
+The deterministic evidence engine is the primary decision layer. Do not invent asymmetry if the V3
+True Asymmetry Status is NOT ESTABLISHED, UNPROVEN, UNFAVORABLE, or TACTICAL ONLY:
 {engine_evidence}
 
 Produce a decision-first trading dashboard:
@@ -1457,7 +1828,7 @@ Produce a decision-first trading dashboard:
 2. WHY NOW: one sentence. If no near-term edge, say so.
 3. BULL CASE: 3 drivers, what goes right, probability (%), trigger to confirm.
 4. BEAR CASE: 3 risks, what breaks, probability (%), trigger to invalidate.
-5. ASYMMETRY: upside/downside balance, what the market may be pricing in vs missing.
+5. ASYMMETRY: use the V3 True Asymmetry Status. If it is not established, say exactly why.
 6. TRADE CARD: horizon, top catalyst, invalidation trigger, key metric to monitor, confidence 1-10.
 
 End with this exact block:
@@ -1475,7 +1846,7 @@ Bull Probability: [%]
 Bear Probability: [%]
 Confidence: [1-10]
 
-Format: 450-650 words. No generic background.
+Format: 450-650 words. No generic background. Bull/bear probabilities are heuristic unless calibrated data is present.
 """.strip()
 
 
@@ -1491,7 +1862,23 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     market_data_text = format_market_data(market_data)
     market_snapshot = build_market_snapshot(market_data)
     engine_scores, trade_verdict, evidence_flags = build_v2_evidence_engine(market_data, v21_data)
-    engine_evidence = format_engine_evidence(engine_scores, trade_verdict, evidence_flags, v21_data)
+    expectations_baseline, payoff_distribution, unconventional_signals, asymmetry_assessment = build_v3_edge_layer(
+        ticker,
+        market_data,
+        v21_data,
+        engine_scores,
+    )
+    trade_verdict = apply_true_asymmetry_guard(trade_verdict, asymmetry_assessment)
+    engine_evidence = format_engine_evidence(
+        engine_scores,
+        trade_verdict,
+        evidence_flags,
+        v21_data,
+        expectations_baseline,
+        payoff_distribution,
+        unconventional_signals,
+        asymmetry_assessment,
+    )
     if market_data.get("error"):
         st.warning(market_data["error"])
         raise UserFacingError(
@@ -1560,6 +1947,10 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         financial_trends=v21_data.get("financial_trends", {}),
         ownership_intel=v21_data.get("ownership_intel", {}),
         narrative_heat=v21_data.get("narrative_heat", {}),
+        expectations_baseline=expectations_baseline,
+        payoff_distribution=payoff_distribution,
+        unconventional_signals=unconventional_signals,
+        asymmetry_assessment=asymmetry_assessment,
     )
     save_cache(result)
     return result
@@ -1723,7 +2114,9 @@ def export_json(result: DDResult) -> str:
 
 
 def export_markdown(result: DDResult) -> str:
-    scores = "\n".join(f"- **{name}:** {score}/10" for name, score in result.dashboard_scores.items())
+    scores = "\n".join(
+        f"- **{display_score_name(name)}:** {score}/10" for name, score in result.dashboard_scores.items()
+    )
     decision = "\n".join(f"- **{name}:** {value}" for name, value in result.decision_card.items())
     market = "\n".join(f"- **{name}:** {value}" for name, value in result.market_snapshot.items())
     verdict = "\n".join(f"- **{name}:** {value}" for name, value in result.trade_verdict.items())
@@ -1732,6 +2125,10 @@ def export_markdown(result: DDResult) -> str:
     trends = markdown_dict(result.financial_trends)
     ownership = markdown_dict(result.ownership_intel)
     narrative = markdown_dict(result.narrative_heat)
+    expectations = markdown_dict(result.expectations_baseline)
+    payoff = markdown_dict(result.payoff_distribution)
+    unconventional = markdown_dict(result.unconventional_signals)
+    true_asymmetry = markdown_dict(result.asymmetry_assessment)
     company = f"\n**Company:** {result.company_name}" if result.company_name else ""
     return f"""# {APP_TITLE}
 
@@ -1756,6 +2153,22 @@ def export_markdown(result: DDResult) -> str:
 ## Evidence Flags
 
 {flags}
+
+## V3 Market Expectations Baseline
+
+{expectations}
+
+## V3 Payoff Distribution
+
+{payoff}
+
+## V3 Unconventional Signals
+
+{unconventional}
+
+## V3 True Asymmetry Assessment
+
+{true_asymmetry}
 
 ## Earnings Intelligence
 
@@ -1798,7 +2211,7 @@ def markdown_dict(values: dict[str, str]) -> str:
 
 
 def render_dashboard(result: DDResult) -> None:
-    st.subheader("V2.1 Trade Verdict")
+    st.subheader("V3 Trade Verdict")
     verdict = result.trade_verdict
     verdict_cols = st.columns([1.2, 1, 1.2, 1.6])
     verdict_cols[0].metric("Verdict", verdict.get("Verdict", result.recommendation))
@@ -1809,7 +2222,8 @@ def render_dashboard(result: DDResult) -> None:
         st.markdown(f"**Why:** {verdict.get('Why', result.recommendation_reason)}")
         st.markdown(f"**Confirm:** {verdict.get('Confirm', 'Not specified')}")
         st.markdown(f"**Invalidate:** {verdict.get('Invalidate', 'Not specified')}")
-        st.markdown(f"**Asymmetry:** {verdict.get('Asymmetry', 'Not specified')}")
+        st.markdown(f"**Discipline skew:** {verdict.get('Asymmetry', 'Not specified')}")
+        st.markdown(f"**True asymmetry:** {verdict.get('True Asymmetry', 'Not assessed')}")
         if result.evidence_flags:
             st.markdown("**Evidence flags:** " + " | ".join(result.evidence_flags))
 
@@ -1823,6 +2237,10 @@ def render_dashboard(result: DDResult) -> None:
     render_info_grid("Quarterly Financial Trends", result.financial_trends)
     render_info_grid("Ownership / Insider Signals", result.ownership_intel)
     render_info_grid("News / Narrative Heat", result.narrative_heat)
+    render_info_grid("V3 Market Expectations Baseline", result.expectations_baseline)
+    render_info_grid("V3 Payoff Distribution", result.payoff_distribution)
+    render_info_grid("V3 Unconventional Signals", result.unconventional_signals)
+    render_info_grid("V3 True Asymmetry Assessment", result.asymmetry_assessment)
 
     st.subheader("Decision Card")
     card = result.decision_card
@@ -1842,10 +2260,10 @@ def render_dashboard(result: DDResult) -> None:
             f"{card.get('Bear Probability', 'Not specified')}"
         )
 
-    st.subheader("V2.1 Evidence Scores")
+    st.subheader("V3 Discipline Scores")
     cols = st.columns(4)
     for index, name in enumerate(SCORE_NAMES):
-        cols[index % len(cols)].metric(name, f"{result.dashboard_scores.get(name, 0)}/10")
+        cols[index % len(cols)].metric(display_score_name(name), f"{result.dashboard_scores.get(name, 0)}/10")
 
     rec = result.recommendation
     if rec == "PROCEED":
@@ -1863,6 +2281,10 @@ def render_info_grid(title: str, values: dict[str, str]) -> None:
     with st.container(border=True):
         for label, value in values.items():
             st.markdown(f"**{label}:** {value}")
+
+
+def display_score_name(name: str) -> str:
+    return "Discipline Skew" if name == "Asymmetry" else name
 
 
 def render_step(title: str, content: str) -> None:

@@ -2,18 +2,22 @@
 
 Production-grade Streamlit app for decision-first equity due diligence and trading insight.
 
-The V2.1 engine computes deterministic market, financial, ownership, earnings, and narrative evidence first,
-then uses OpenAI to explain the setup tersely.
+The V3 engine computes deterministic market, financial, ownership, earnings, narrative, expectations, and payoff
+evidence first, then uses OpenAI to explain the setup tersely.
 The goal is not a company story; it is a fast read on whether a ticker is chaseable, waitlist-only, event-driven,
 or avoid.
 
 ## Features
 
 - Ticker input and validation
-- Deterministic V2.1 evidence engine
+- Deterministic V3 discipline and edge engine
 - Earnings date/surprise intelligence
 - Quarterly financial trend extraction
 - Ownership, insider, analyst recommendation, and narrative heat checks
+- Options-implied move and sell-side target expectations baseline
+- Bull/base/bear payoff distribution
+- SEC filing scan for shelf/offering overhang and recent 8-K activity
+- True-asymmetry gate that refuses to claim edge without expectations + payoff + non-consensus evidence
 - Three sequential GPT synthesis steps
 - Cached ticker reports with a cached-on timestamp
 - Dashboard scores from 1-10 for momentum, exhaustion, fundamental trend, valuation stretch, event risk,
@@ -23,9 +27,11 @@ or avoid.
 - JSON, Markdown, and copy-to-clipboard exports
 - Friendly handling for missing API keys, invalid tickers, rate limits, timeouts, and API errors
 
-## V2.1 Logic
+## V3 Logic
 
-The app pulls public market intelligence using yfinance/Yahoo Finance, then computes:
+The app separates discipline from edge.
+
+The discipline layer pulls public market intelligence using yfinance/Yahoo Finance, then computes:
 
 - Momentum
 - Exhaustion Risk
@@ -36,7 +42,14 @@ The app pulls public market intelligence using yfinance/Yahoo Finance, then comp
 - Ownership Signal
 - Narrative Heat
 - Squeeze Risk
-- Asymmetry
+- Discipline Skew
+
+The edge layer then asks whether true asymmetry can be established:
+
+- What is already priced in through options implied move and sell-side targets?
+- What is the bull/base/bear payoff map?
+- Is there any non-consensus signal from filings, insider activity, or less-common data?
+- Is the result calibrated or still heuristic?
 
 OpenAI receives those computed facts and explains the trade setup, catalyst, invalidation trigger, and key metric.
 The model is synthesis, not the primary scoring engine.
@@ -50,6 +63,9 @@ The framework is built for quick trading decisions:
 - Reward catalysts only when timing and evidence are visible.
 - Treat missing data as a risk signal instead of filling gaps with confident prose.
 - Surface the one or two datapoints that would change the view.
+- No market expectations baseline means no true asymmetry claim.
+- No payoff distribution means no true asymmetry claim.
+- No non-consensus evidence means no edge claim.
 
 ## Setup
 
