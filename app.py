@@ -158,7 +158,11 @@ def get_openai_client() -> OpenAI:
 
 
 def get_model() -> str:
-    return str(get_secret("OPENAI_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
+    configured = str(get_secret("OPENAI_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
+    allow_legacy_turbo = bool(get_secret("ALLOW_LEGACY_TURBO", False))
+    if configured == "gpt-4-turbo" and not allow_legacy_turbo:
+        return DEFAULT_MODEL
+    return configured
 
 
 def fetch_market_data(ticker: str) -> dict[str, Any]:

@@ -83,6 +83,7 @@ OPENAI_MODEL = "gpt-4.1"
 OPENAI_TIMEOUT_SECONDS = 180
 CACHE_DIR = "cache"
 ALLOW_MODEL_OVERRIDE = false
+ALLOW_LEGACY_TURBO = false
 ```
 
 ## Run
@@ -93,4 +94,4 @@ streamlit run app.py
 
 ## Model Notes
 
-The app defaults to `gpt-4.1` for stronger instruction following than the original `gpt-4-turbo` workflow. For stronger current citations, set `OPENAI_MODEL` to a search-enabled or newer OpenAI model available to your account.
+The app defaults to `gpt-4.1` for stronger instruction following than the original `gpt-4-turbo` workflow. A legacy `OPENAI_MODEL = "gpt-4-turbo"` secret is automatically upgraded to the default unless `ALLOW_LEGACY_TURBO = true`. For stronger current citations, set `OPENAI_MODEL` to a search-enabled or newer OpenAI model available to your account.
