@@ -15,7 +15,7 @@ or avoid.
 - Quarterly financial trend extraction
 - Ownership, insider, analyst recommendation, and narrative heat checks
 - Options-implied move and sell-side target expectations baseline
-- Bull/base/bear payoff distribution
+- Bull/base/stress scenario map with unweighted magnitude ratio
 - SEC filing scan for shelf/offering overhang and recent 8-K activity
 - True-asymmetry gate that refuses to claim edge without expectations + payoff + non-consensus evidence
 - Three sequential GPT synthesis steps
@@ -47,7 +47,7 @@ The discipline layer pulls public market intelligence using yfinance/Yahoo Finan
 The edge layer then asks whether true asymmetry can be established:
 
 - What is already priced in through options implied move and sell-side targets?
-- What is the bull/base/bear payoff map?
+- What is the bull/base/stress scenario map?
 - Is there any non-consensus signal from filings, insider activity, or less-common data?
 - Is the result calibrated or still heuristic?
 
@@ -64,7 +64,7 @@ The framework is built for quick trading decisions:
 - Treat missing data as a risk signal instead of filling gaps with confident prose.
 - Surface the one or two datapoints that would change the view.
 - No market expectations baseline means no true asymmetry claim.
-- No payoff distribution means no true asymmetry claim.
+- No calibrated probability-weighted payoff means no true asymmetry claim.
 - No non-consensus evidence means no edge claim.
 
 ## Setup
@@ -79,7 +79,7 @@ Create `.streamlit/secrets.toml`:
 
 ```toml
 OPENAI_API_KEY = "sk-your-key"
-OPENAI_MODEL = "gpt-4-turbo"
+OPENAI_MODEL = "gpt-4.1"
 OPENAI_TIMEOUT_SECONDS = 180
 CACHE_DIR = "cache"
 ALLOW_MODEL_OVERRIDE = false
@@ -93,4 +93,4 @@ streamlit run app.py
 
 ## Model Notes
 
-The app defaults to `gpt-4-turbo` to match the original workflow. For stronger current citations, set `OPENAI_MODEL` to a search-enabled or newer OpenAI model available to your account.
+The app defaults to `gpt-4.1` for stronger instruction following than the original `gpt-4-turbo` workflow. For stronger current citations, set `OPENAI_MODEL` to a search-enabled or newer OpenAI model available to your account.

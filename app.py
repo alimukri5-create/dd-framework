@@ -21,7 +21,7 @@ from openai import APIConnectionError, APIError, APITimeoutError, Authentication
 
 
 APP_TITLE = "DD Framework - Institutional Due Diligence"
-DEFAULT_MODEL = "gpt-4-turbo"
+DEFAULT_MODEL = "gpt-4.1"
 DEFAULT_TIMEOUT_SECONDS = 180
 SCORE_NAMES = [
     "Momentum",
@@ -822,7 +822,6 @@ def build_payoff_distribution(data: dict[str, Any], expectations: dict[str, str]
 
     target = number_or_none(data.get("target_mean_price"))
     target_high = number_or_none(data.get("target_high_price"))
-    target_low = number_or_none(data.get("target_low_price"))
     high_52w = number_or_none(data.get("fifty_two_week_high"))
     low_52w = number_or_none(data.get("fifty_two_week_low"))
     cash = number_or_none(data.get("total_cash"))
@@ -837,36 +836,53 @@ def build_payoff_distribution(data: dict[str, Any], expectations: dict[str, str]
             price * (1 + (implied_move or 20) / 100),
         ]
     )
-    base_price = first_valid_number([target, price])
-    bear_floor = first_valid_number(
-        [
-            target_low if target_low and target_low < price else None,
+    base_price = price
+    market_implied_downside = price * (1 - implied_move / 100) if implied_move else None
+    stress_price = min(
+        value
+        for value in [
+            market_implied_downside,
             low_52w if low_52w and low_52w < price else None,
             cash_per_share if cash_per_share and cash_per_share < price else None,
             price * 0.8,
         ]
+        if value is not None and value > 0
     )
-    bear_price = max(cash_per_share or 0, bear_floor) if bear_floor else price * 0.8
+    technical_support = first_valid_number(
+        [
+            low_52w if low_52w and low_52w < price else None,
+        ]
+    )
 
     upside = percent_change(bull_price, price) if bull_price else None
     base = percent_change(base_price, price) if base_price else None
-    downside = percent_change(bear_price, price) if bear_price else None
+    downside = percent_change(stress_price, price) if stress_price else None
+    consensus_gap = percent_change(target, price) if target else None
     payoff: dict[str, str] = {
         "Current Price": format_market_value(price),
+        "Consensus Target (Not Base Case)": (
+            f"{format_market_value(target)} ({format_signed_percent(consensus_gap)})" if target else "N/A"
+        ),
         "Bull Case Price": format_market_value(bull_price) if bull_price else "N/A",
-        "Base Case Price": format_market_value(base_price) if base_price else "N/A",
-        "Bear Case Floor": format_market_value(bear_price),
-        "Bull / Base / Bear Move": (
+        "Base Case Price": f"{format_market_value(base_price)} (current price until catalyst confirms)",
+        "Downside Stress Price": format_market_value(stress_price),
+        "Bull / Base / Stress Move": (
             f"{format_signed_percent(upside)} / {format_signed_percent(base)} / {format_signed_percent(downside)}"
         ),
     }
+    if technical_support:
+        payoff["52W Technical Support"] = format_market_value(technical_support)
     if cash_per_share:
-        payoff["Cash Per Share Floor"] = format_market_value(cash_per_share)
+        payoff["Cash Per Share Reference"] = format_market_value(cash_per_share)
     if upside is not None and downside is not None and downside < 0:
-        payoff["Upside/Downside Ratio"] = f"{upside / abs(downside):,.2f}x"
+        payoff["Payoff Magnitude Ratio (Unweighted)"] = f"{upside / abs(downside):,.2f}x"
     else:
-        payoff["Upside/Downside Ratio"] = "N/A"
-    payoff["Payoff Status"] = "Heuristic: uses listed options, sell-side targets, 52-week range, and cash/share when available."
+        payoff["Payoff Magnitude Ratio (Unweighted)"] = "N/A"
+    payoff["Probability-Weighted Edge"] = "Not calculated: requires calibrated hit/miss probabilities."
+    payoff["Payoff Status"] = (
+        "Scenario map, not a distribution. Sell-side target is shown as consensus expectation, "
+        "not base case; ratio is magnitude-only and not probability-weighted."
+    )
     return payoff
 
 
@@ -941,9 +957,12 @@ def build_true_asymmetry_assessment(
     payoff: dict[str, str],
     unconventional: dict[str, str],
 ) -> dict[str, str]:
-    ratio = parse_first_number(payoff.get("Upside/Downside Ratio"))
+    ratio = parse_first_number(payoff.get("Payoff Magnitude Ratio (Unweighted)"))
     has_expectations = "Options Implied Move" in expectations or "Sell-Side Mean Target Gap" in expectations
     has_payoff = ratio is not None
+    has_probability_weighted_edge = not str(payoff.get("Probability-Weighted Edge", "")).lower().startswith(
+        "not calculated"
+    )
     shelf_text = unconventional.get("Shelf/Offering Overhang", "")
     has_offering_overhang = bool(shelf_text and not shelf_text.lower().startswith("no "))
     insider_signal = unconventional.get("Insider Cluster Signal", "")
@@ -958,6 +977,11 @@ def build_true_asymmetry_assessment(
     elif ratio < 1.5:
         status = "UNFAVORABLE"
         reason = f"Upside/downside ratio is only {ratio:,.2f}x."
+    elif not has_probability_weighted_edge:
+        status = "UNPROVEN"
+        reason = "Payoff map is magnitude-only; no calibrated probability-weighted edge is calculated."
+        if has_offering_overhang:
+            reason += " Shelf/offering overhang is also present."
     elif has_offering_overhang:
         status = "TACTICAL ONLY"
         reason = "Payoff skew is visible, but shelf/offering overhang blocks a clean asymmetric claim."
@@ -973,7 +997,7 @@ def build_true_asymmetry_assessment(
     return {
         "True Asymmetry Status": status,
         "Reason": reason,
-        "Required Standard": "Market baseline + payoff distribution + non-consensus evidence.",
+        "Required Standard": "Market baseline + calibrated probability-weighted payoff + non-consensus evidence.",
         "Calibration Status": "Uncalibrated: use as a checklist until historical forward-return validation exists.",
     }
 
@@ -1465,7 +1489,7 @@ def format_engine_evidence(
                 v21_lines.append("")
     v3_sections = {
         "MARKET EXPECTATIONS BASELINE": expectations_baseline or {},
-        "PAYOFF DISTRIBUTION": payoff_distribution or {},
+        "SCENARIO MAP / UNCALIBRATED PAYOFF": payoff_distribution or {},
         "UNCONVENTIONAL / LESS-COMMON SIGNALS": unconventional_signals or {},
         "TRUE ASYMMETRY ASSESSMENT": asymmetry_assessment or {},
     }
@@ -1848,8 +1872,8 @@ Produce a decision-first trading dashboard:
 1. DECISION: Use the deterministic trade verdict exactly. Distinguish the verdict from action:
    for example, WAIT FOR PULLBACK can map to Action: HOLD and Bias: WATCHLIST.
 2. WHY NOW: one sentence. If no near-term edge, say so.
-3. BULL CASE: 3 drivers, what goes right, probability (%), trigger to confirm.
-4. BEAR CASE: 3 risks, what breaks, probability (%), trigger to invalidate.
+3. BULL CASE: 3 drivers, what goes right, and trigger to confirm. Do not invent probability.
+4. BEAR CASE: 3 risks, what breaks, and trigger to invalidate. Do not invent probability.
 5. ASYMMETRY: use the V3 True Asymmetry Status. If it is not established, say exactly why.
 6. TRADE CARD: horizon, top catalyst, invalidation trigger, key metric to monitor, confidence 1-10.
 
@@ -1864,11 +1888,11 @@ Why Now: [one sentence]
 Top Catalyst: [one sentence]
 Invalidation: [one sentence]
 Key Metric: [one sentence]
-Bull Probability: [%]
-Bear Probability: [%]
+Bull Probability: [use calibrated value only, otherwise Uncalibrated]
+Bear Probability: [use calibrated value only, otherwise Uncalibrated]
 Confidence: [1-10]
 
-Format: 450-650 words. No generic background. Bull/bear probabilities are heuristic unless calibrated data is present.
+Format: 450-650 words. No generic background. Do not output numeric bull/bear probabilities unless the deterministic evidence provides calibrated probabilities.
 """.strip()
 
 
@@ -1946,6 +1970,14 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     recommendation = trade_verdict["Action"]
     reason = trade_verdict["Why"]
     decision_card = extract_decision_card(step_3, recommendation, reason)
+    decision_card = apply_deterministic_card_defaults(
+        decision_card,
+        trade_verdict,
+        v21_data,
+        payoff_distribution,
+        asymmetry_assessment,
+        reason,
+    )
     decision_card["Engine Verdict"] = trade_verdict["Verdict"]
     decision_card["Trade Type"] = trade_verdict["Trade Type"]
     decision_card["Action"] = trade_verdict["Action"]
@@ -2066,6 +2098,75 @@ def extract_decision_card(step_3: str, recommendation: str, reason: str) -> dict
         "Bear Probability": clean_probability_field(bear_field) or format_probability(extract_probability(step_3, "bear")),
         "Confidence": clean_confidence_field(confidence_field) or "Not specified",
     }
+
+
+def apply_deterministic_card_defaults(
+    card: dict[str, str],
+    verdict: dict[str, str],
+    v21_data: dict[str, Any],
+    payoff: dict[str, str],
+    asymmetry: dict[str, str],
+    reason: str,
+) -> dict[str, str]:
+    updated = dict(card)
+    earnings = v21_data.get("earnings_intel", {})
+    trends = v21_data.get("financial_trends", {})
+    days = int_or_none(earnings.get("Days To Earnings"))
+    horizon = f"Through next earnings in {days} days" if days is not None and days >= 0 else "1-90 days"
+    key_metric = deterministic_key_metric(trends)
+    defaults = {
+        "Action": verdict.get("Action", updated.get("Action", "HOLD")),
+        "Bias": verdict.get("Bias", updated.get("Bias", "WATCHLIST")),
+        "Horizon": horizon,
+        "Why Now": reason,
+        "Top Catalyst": deterministic_top_catalyst(earnings, verdict),
+        "Invalidation": verdict.get("Invalidate", "Catalyst fails to confirm the setup."),
+        "Key Metric": key_metric,
+        "Bull Probability": "Uncalibrated",
+        "Bear Probability": "Uncalibrated",
+        "Confidence": deterministic_confidence(asymmetry, payoff),
+    }
+    for field, fallback in defaults.items():
+        if is_unspecified(updated.get(field)):
+            updated[field] = fallback
+    if payoff.get("Probability-Weighted Edge", "").lower().startswith("not calculated"):
+        updated["Bull Probability"] = "Uncalibrated"
+        updated["Bear Probability"] = "Uncalibrated"
+        updated["Confidence"] = deterministic_confidence(asymmetry, payoff)
+    return updated
+
+
+def is_unspecified(value: str | None) -> bool:
+    return value is None or value.strip() in {"", "Not specified", "N/A"}
+
+
+def deterministic_top_catalyst(earnings: dict[str, str], verdict: dict[str, str]) -> str:
+    if earnings.get("Next Earnings"):
+        return f"Next earnings on {earnings['Next Earnings']}."
+    if verdict.get("Trade Type") == "WAIT FOR CATALYST":
+        return "Next disclosed catalyst that can confirm revenue, margins, or guidance."
+    return "No clean dated catalyst found; wait for confirmation."
+
+
+def deterministic_key_metric(trends: dict[str, str]) -> str:
+    if trends.get("Quarterly Operating Income Trend"):
+        return "Operating income trend versus revenue growth."
+    if trends.get("Quarterly FCF Trend"):
+        return "Free cash flow trend."
+    if trends.get("Quarterly Revenue Trend"):
+        return "Quarterly revenue trend."
+    return "Revenue, margin, and cash burn at next update."
+
+
+def deterministic_confidence(asymmetry: dict[str, str], payoff: dict[str, str]) -> str:
+    status = asymmetry.get("True Asymmetry Status", "")
+    if status in {"NOT ESTABLISHED", "UNPROVEN"}:
+        return "4/10"
+    if payoff.get("Probability-Weighted Edge", "").lower().startswith("not calculated"):
+        return "4/10"
+    if status == "UNFAVORABLE":
+        return "5/10"
+    return "6/10"
 
 
 def extract_card_field(text: str, field: str) -> str | None:
@@ -2201,7 +2302,7 @@ def export_markdown(result: DDResult) -> str:
 
 {expectations}
 
-## V3 Payoff Distribution
+## V3 Scenario Map
 
 {payoff}
 
@@ -2281,7 +2382,7 @@ def render_dashboard(result: DDResult) -> None:
     render_info_grid("Ownership / Insider Signals", result.ownership_intel)
     render_info_grid("News / Narrative Heat", result.narrative_heat)
     render_info_grid("V3 Market Expectations Baseline", result.expectations_baseline)
-    render_info_grid("V3 Payoff Distribution", result.payoff_distribution)
+    render_info_grid("V3 Scenario Map", result.payoff_distribution)
     render_info_grid("V3 Unconventional Signals", result.unconventional_signals)
     render_info_grid("V3 True Asymmetry Assessment", result.asymmetry_assessment)
 
