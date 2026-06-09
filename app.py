@@ -1952,7 +1952,7 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
     decision_card["Bias"] = trade_verdict["Bias"]
     result = DDResult(
         ticker=ticker,
-        company_name=extract_company_name(step_1),
+        company_name=extract_company_name(step_1) or market_data.get("name"),
         cached_at=datetime.now(timezone.utc).isoformat(),
         model=model,
         step_1=step_1,
@@ -2051,6 +2051,9 @@ def score_risk_reward(text: str, step_3: str) -> int:
 
 
 def extract_decision_card(step_3: str, recommendation: str, reason: str) -> dict[str, str]:
+    bull_field = extract_card_field(step_3, "Bull Probability")
+    bear_field = extract_card_field(step_3, "Bear Probability")
+    confidence_field = extract_card_field(step_3, "Confidence")
     return {
         "Action": extract_card_field(step_3, "Action") or recommendation,
         "Bias": extract_card_field(step_3, "Bias") or bias_from_recommendation(recommendation),
@@ -2059,17 +2062,35 @@ def extract_decision_card(step_3: str, recommendation: str, reason: str) -> dict
         "Top Catalyst": extract_card_field(step_3, "Top Catalyst") or "Not specified",
         "Invalidation": extract_card_field(step_3, "Invalidation") or "Not specified",
         "Key Metric": extract_card_field(step_3, "Key Metric") or "Not specified",
-        "Bull Probability": extract_card_field(step_3, "Bull Probability") or format_probability(extract_probability(step_3, "bull")),
-        "Bear Probability": extract_card_field(step_3, "Bear Probability") or format_probability(extract_probability(step_3, "bear")),
-        "Confidence": extract_card_field(step_3, "Confidence") or "Not specified",
+        "Bull Probability": clean_probability_field(bull_field) or format_probability(extract_probability(step_3, "bull")),
+        "Bear Probability": clean_probability_field(bear_field) or format_probability(extract_probability(step_3, "bear")),
+        "Confidence": clean_confidence_field(confidence_field) or "Not specified",
     }
 
 
 def extract_card_field(text: str, field: str) -> str | None:
-    match = re.search(rf"^\s*{re.escape(field)}\s*:\s*(.+?)\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+    match = re.search(
+        rf"^\s*(?:[-*]\s*)?\**{re.escape(field)}\**\s*:\s*(.+?)\s*$",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
     if not match:
         return None
-    return match.group(1).strip()
+    return match.group(1).strip(" *")
+
+
+def clean_probability_field(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"\b(\d{1,3})\s*%", value)
+    return f"{match.group(1)}%" if match else value
+
+
+def clean_confidence_field(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"\b(\d{1,2})\s*/\s*10\b", value)
+    return f"{match.group(1)}/10" if match else value
 
 
 def bias_from_recommendation(recommendation: str) -> str:
