@@ -71,6 +71,10 @@ class DDResult:
     payoff_distribution: dict[str, str]
     unconventional_signals: dict[str, str]
     asymmetry_assessment: dict[str, str]
+    historical_calibration: dict[str, str]
+    event_study: dict[str, str]
+    factor_analysis: dict[str, str]
+    meta_label: dict[str, str]
 
 
 class UserFacingError(Exception):
@@ -1019,6 +1023,356 @@ def apply_true_asymmetry_guard(verdict: dict[str, str], asymmetry: dict[str, str
     return guarded
 
 
+def build_v4_calibration_layer(
+    ticker: str,
+    data: dict[str, Any],
+    scores: dict[str, int],
+    verdict: dict[str, str],
+    v21_data: dict[str, Any],
+    unconventional: dict[str, str],
+    asymmetry: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]]:
+    """Add empirical context before the trade card becomes actionable."""
+    history = fetch_price_history(ticker, period="3y")
+    calibration = build_historical_calibration(data, history)
+    events = build_event_study(history, unconventional, v21_data)
+    factors = build_factor_analysis(ticker, history)
+    meta = build_meta_label(scores, verdict, asymmetry, calibration, events, factors)
+    return calibration, events, factors, meta
+
+
+def fetch_price_history(ticker: str, period: str = "3y") -> Any:
+    try:
+        clear_proxy_env_for_market_data()
+        yf_cache_dir = Path(tempfile.gettempdir()) / "dd-framework-yfinance-cache"
+        yf_cache_dir.mkdir(parents=True, exist_ok=True)
+        yf.set_tz_cache_location(str(yf_cache_dir))
+        asset = yf.Ticker(ticker)
+        history = asset.history(period=period, interval="1d", auto_adjust=True)
+        if history is None or history.empty or "Close" not in history:
+            return None
+        return history.dropna(subset=["Close"])
+    except Exception:
+        return None
+
+
+def build_historical_calibration(data: dict[str, Any], history: Any) -> dict[str, str]:
+    if history is None or history.empty or len(history) < 120:
+        return {"Calibration Status": "Unavailable: not enough historical price data."}
+
+    close = history["Close"].dropna()
+    current_r1 = number_or_none(data.get("return_1m"))
+    current_r3 = number_or_none(data.get("return_3m"))
+    if current_r1 is None or current_r3 is None:
+        return {"Calibration Status": "Unavailable: current 1M/3M setup returns missing."}
+
+    samples: list[dict[str, float]] = []
+    for index in range(63, len(close) - 60):
+        r1 = historical_return(close, index, 21)
+        r3 = historical_return(close, index, 63)
+        if r1 is None or r3 is None:
+            continue
+        if not is_similar_setup(r1, current_r1) or not is_similar_setup(r3, current_r3):
+            continue
+        row = {"r1": r1, "r3": r3}
+        for horizon in [5, 20, 60]:
+            row[f"fwd_{horizon}"] = forward_return(close, index, horizon)
+        row["max_drawdown_20"] = max_drawdown_forward(close, index, 20)
+        row["max_runup_20"] = max_runup_forward(close, index, 20)
+        samples.append(row)
+
+    calibration = {
+        "Current Setup": f"1M {current_r1:,.1f}%, 3M {current_r3:,.1f}%",
+        "Analog Definition": "Same ticker history with similar 1M and 3M return profile.",
+        "Analog Sample Size": str(len(samples)),
+    }
+    if not samples:
+        calibration["Calibration Status"] = "Thin: no historical analogs found."
+        return calibration
+
+    for horizon in [5, 20, 60]:
+        values = [sample[f"fwd_{horizon}"] for sample in samples if sample.get(f"fwd_{horizon}") is not None]
+        if values:
+            calibration[f"{horizon}D Forward Median"] = format_signed_percent(median(values))
+            calibration[f"{horizon}D Forward Hit Rate"] = f"{hit_rate(values):,.0f}%"
+    drawdowns = [sample["max_drawdown_20"] for sample in samples if sample.get("max_drawdown_20") is not None]
+    runups = [sample["max_runup_20"] for sample in samples if sample.get("max_runup_20") is not None]
+    if drawdowns:
+        calibration["20D Median Max Drawdown"] = format_signed_percent(median(drawdowns))
+    if runups:
+        calibration["20D Median Max Runup"] = format_signed_percent(median(runups))
+    calibration["Calibration Status"] = "Usable" if len(samples) >= 10 else "Thin sample: directional only."
+    return calibration
+
+
+def is_similar_setup(observed: float, current: float) -> bool:
+    tolerance = max(10.0, abs(current) * 0.55)
+    return abs(observed - current) <= tolerance and (observed == 0 or current == 0 or observed * current >= 0)
+
+
+def historical_return(close: Any, index: int, periods: int) -> float | None:
+    if index - periods < 0:
+        return None
+    start = float(close.iloc[index - periods])
+    end = float(close.iloc[index])
+    return None if start == 0 else (end / start - 1) * 100
+
+
+def forward_return(close: Any, index: int, periods: int) -> float | None:
+    if index + periods >= len(close):
+        return None
+    start = float(close.iloc[index])
+    end = float(close.iloc[index + periods])
+    return None if start == 0 else (end / start - 1) * 100
+
+
+def max_drawdown_forward(close: Any, index: int, periods: int) -> float | None:
+    if index + 1 >= len(close):
+        return None
+    start = float(close.iloc[index])
+    window = close.iloc[index + 1 : min(len(close), index + periods + 1)]
+    if start == 0 or window.empty:
+        return None
+    return (float(window.min()) / start - 1) * 100
+
+
+def max_runup_forward(close: Any, index: int, periods: int) -> float | None:
+    if index + 1 >= len(close):
+        return None
+    start = float(close.iloc[index])
+    window = close.iloc[index + 1 : min(len(close), index + periods + 1)]
+    if start == 0 or window.empty:
+        return None
+    return (float(window.max()) / start - 1) * 100
+
+
+def build_event_study(history: Any, unconventional: dict[str, str], v21_data: dict[str, Any]) -> dict[str, str]:
+    if history is None or history.empty:
+        return {"Event Study Status": "Unavailable: no price history."}
+    event_dates = parse_event_dates(unconventional, v21_data)
+    if not event_dates:
+        return {"Event Study Status": "No dated SEC/earnings events available for event study."}
+    close = history["Close"].dropna()
+    rows: list[dict[str, float | str]] = []
+    for label, event_date in event_dates[:12]:
+        index = nearest_history_index(close, event_date)
+        if index is None:
+            continue
+        rows.append(
+            {
+                "label": label,
+                "date": event_date.isoformat(),
+                "pre_5d": historical_return(close, index, 5),
+                "post_5d": forward_return(close, index, 5),
+                "post_20d": forward_return(close, index, 20),
+                "drawdown_20d": max_drawdown_forward(close, index, 20),
+            }
+        )
+    if not rows:
+        return {"Event Study Status": "No events matched available trading history."}
+    post_5 = [row["post_5d"] for row in rows if isinstance(row.get("post_5d"), float)]
+    post_20 = [row["post_20d"] for row in rows if isinstance(row.get("post_20d"), float)]
+    drawdowns = [row["drawdown_20d"] for row in rows if isinstance(row.get("drawdown_20d"), float)]
+    study = {
+        "Events Studied": str(len(rows)),
+        "Recent Event Sample": "; ".join(f"{row['label']} {row['date']}" for row in rows[:4]),
+        "Event Study Status": "Thin sample: event reaction context only.",
+    }
+    if post_5:
+        study["Median Post-Event 5D"] = format_signed_percent(median(post_5))
+        study["Post-Event 5D Hit Rate"] = f"{hit_rate(post_5):,.0f}%"
+    if post_20:
+        study["Median Post-Event 20D"] = format_signed_percent(median(post_20))
+        study["Post-Event 20D Hit Rate"] = f"{hit_rate(post_20):,.0f}%"
+    if drawdowns:
+        study["Median Post-Event 20D Drawdown"] = format_signed_percent(median(drawdowns))
+    return study
+
+
+def parse_event_dates(unconventional: dict[str, str], v21_data: dict[str, Any]) -> list[tuple[str, datetime.date]]:
+    events: list[tuple[str, datetime.date]] = []
+    for key in ["Recent SEC Filings", "Shelf/Offering Overhang"]:
+        text = unconventional.get(key, "")
+        for match in re.finditer(r"\b([A-Z0-9/\\-]+)\s+(\d{4}-\d{2}-\d{2})", text):
+            try:
+                events.append((match.group(1), datetime.fromisoformat(match.group(2)).date()))
+            except ValueError:
+                continue
+    for key in ["Last Earnings Date", "Next Earnings"]:
+        value = v21_data.get("earnings_intel", {}).get(key)
+        if value:
+            try:
+                events.append((key, datetime.fromisoformat(str(value).split()[0]).date()))
+            except ValueError:
+                continue
+    deduped: list[tuple[str, datetime.date]] = []
+    seen: set[tuple[str, datetime.date]] = set()
+    for event in events:
+        if event not in seen:
+            deduped.append(event)
+            seen.add(event)
+    return deduped
+
+
+def nearest_history_index(close: Any, event_date: Any) -> int | None:
+    try:
+        dates = [item.date() if hasattr(item, "date") else item for item in close.index]
+        candidates = [(idx, abs((date - event_date).days)) for idx, date in enumerate(dates)]
+        candidates = [candidate for candidate in candidates if candidate[1] <= 5]
+        return min(candidates, key=lambda item: item[1])[0] if candidates else None
+    except Exception:
+        return None
+
+
+def build_factor_analysis(ticker: str, history: Any) -> dict[str, str]:
+    if history is None or history.empty or len(history) < 80:
+        return {"Factor Status": "Unavailable: not enough ticker history."}
+    try:
+        spy = fetch_price_history("SPY", period="3y")
+        iwm = fetch_price_history("IWM", period="3y")
+        if spy is None or iwm is None:
+            return {"Factor Status": "Unavailable: benchmark history missing."}
+        returns = align_return_series(
+            history["Close"].pct_change().dropna() * 100,
+            spy["Close"].pct_change().dropna() * 100,
+            iwm["Close"].pct_change().dropna() * 100,
+        )
+        if len(returns[0]) < 60:
+            return {"Factor Status": "Unavailable: not enough aligned return observations."}
+        stock, spy_returns, iwm_returns = returns
+        beta_spy = beta(stock[-126:], spy_returns[-126:])
+        beta_iwm = beta(stock[-126:], iwm_returns[-126:])
+        raw_20 = compounded_return(stock[-20:])
+        spy_20 = compounded_return(spy_returns[-20:])
+        iwm_20 = compounded_return(iwm_returns[-20:])
+        alpha_spy = raw_20 - beta_spy * spy_20 if beta_spy is not None else None
+        alpha_iwm = raw_20 - beta_iwm * iwm_20 if beta_iwm is not None else None
+        return {
+            "20D Raw Return": format_signed_percent(raw_20),
+            "SPY Beta 126D": format_market_value(beta_spy) if beta_spy is not None else "N/A",
+            "IWM Beta 126D": format_market_value(beta_iwm) if beta_iwm is not None else "N/A",
+            "20D SPY-Adjusted Move": format_signed_percent(alpha_spy),
+            "20D IWM-Adjusted Move": format_signed_percent(alpha_iwm),
+            "Factor Status": "Heuristic single-factor adjustment; not a full risk model.",
+        }
+    except Exception as exc:
+        return {"Factor Status": f"Unavailable: {exc}"}
+
+
+def align_return_series(*series_items: Any) -> tuple[list[float], ...]:
+    try:
+        import pandas as pd
+
+        normalized = []
+        for series in series_items:
+            item = series.copy()
+            item.index = pd.to_datetime(item.index).date
+            normalized.append(item)
+        frame = pd.concat(normalized, axis=1, join="inner").dropna()
+        return tuple(frame.iloc[:, index].astype(float).tolist() for index in range(frame.shape[1]))
+    except Exception:
+        return tuple([] for _ in series_items)
+
+
+def beta(stock: list[float], benchmark: list[float]) -> float | None:
+    if len(stock) < 20 or len(stock) != len(benchmark):
+        return None
+    mean_stock = sum(stock) / len(stock)
+    mean_benchmark = sum(benchmark) / len(benchmark)
+    variance = sum((item - mean_benchmark) ** 2 for item in benchmark)
+    if variance == 0:
+        return None
+    covariance = sum((stock[i] - mean_stock) * (benchmark[i] - mean_benchmark) for i in range(len(stock)))
+    return covariance / variance
+
+
+def compounded_return(values: list[float]) -> float:
+    total = 1.0
+    for value in values:
+        total *= 1 + value / 100
+    return (total - 1) * 100
+
+
+def build_meta_label(
+    scores: dict[str, int],
+    verdict: dict[str, str],
+    asymmetry: dict[str, str],
+    calibration: dict[str, str],
+    events: dict[str, str],
+    factors: dict[str, str],
+) -> dict[str, str]:
+    label = "AVOID"
+    reasons: list[str] = []
+    if verdict.get("Action") == "AVOID":
+        reasons.append("Deterministic verdict is AVOID.")
+    if asymmetry.get("True Asymmetry Status") in {"NOT ESTABLISHED", "UNPROVEN", "UNFAVORABLE"}:
+        reasons.append(f"True asymmetry is {asymmetry.get('True Asymmetry Status')}.")
+    if scores.get("Dilution Risk", 5) >= 8:
+        reasons.append("Dilution risk is high.")
+    if scores.get("Valuation Stretch", 5) >= 8:
+        reasons.append("Valuation stretch is high.")
+
+    fwd_20 = parse_percent_from_text(calibration.get("20D Forward Median"))
+    hit_20 = parse_percent_from_text(calibration.get("20D Forward Hit Rate"))
+    alpha_iwm = parse_percent_from_text(factors.get("20D IWM-Adjusted Move"))
+    if verdict.get("Action") == "PROCEED" and asymmetry.get("True Asymmetry Status") == "POTENTIALLY ASYMMETRIC":
+        label = "TAKE"
+        reasons.append("Verdict and true-asymmetry gate align.")
+    elif fwd_20 is not None and hit_20 is not None and fwd_20 > 0 and hit_20 >= 55 and scores.get("Dilution Risk", 5) < 8:
+        label = "WATCH / WAIT FOR TRIGGER"
+        reasons.append("Historical analogs are constructive, but deterministic gate is not fully open.")
+    elif (
+        alpha_iwm is not None
+        and alpha_iwm > 10
+        and verdict.get("Action") != "AVOID"
+        and asymmetry.get("True Asymmetry Status") not in {"UNFAVORABLE", "NOT ESTABLISHED"}
+    ):
+        label = "TACTICAL WATCH"
+        reasons.append("Recent move is idiosyncratically strong after IWM adjustment.")
+
+    if not reasons:
+        reasons.append("No calibrated edge or clean trigger found.")
+    confidence = meta_label_confidence(calibration, events, factors)
+    return {
+        "Meta Label": label,
+        "Reason": " ".join(reasons),
+        "Confidence": confidence,
+        "Calibration Input": calibration.get("Calibration Status", "Unknown"),
+        "Event Input": events.get("Event Study Status", "Unknown"),
+        "Factor Input": factors.get("Factor Status", "Unknown"),
+    }
+
+
+def meta_label_confidence(calibration: dict[str, str], events: dict[str, str], factors: dict[str, str]) -> str:
+    points = 2
+    sample_size = int_or_none(calibration.get("Analog Sample Size")) or 0
+    if sample_size >= 20:
+        points += 3
+    elif sample_size >= 10:
+        points += 2
+    elif sample_size >= 5:
+        points += 1
+    if events.get("Events Studied") and int_or_none(events.get("Events Studied")):
+        points += 1
+    if "20D IWM-Adjusted Move" in factors:
+        points += 1
+    return f"{clamp_score(points)}/10"
+
+
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2
+
+
+def hit_rate(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(1 for value in values if value > 0) / len(values) * 100
+
+
 def build_v2_evidence_engine(
     data: dict[str, Any], v21_data: dict[str, Any] | None = None
 ) -> tuple[dict[str, int], dict[str, str], list[str]]:
@@ -1474,6 +1828,10 @@ def format_engine_evidence(
     payoff_distribution: dict[str, str] | None = None,
     unconventional_signals: dict[str, str] | None = None,
     asymmetry_assessment: dict[str, str] | None = None,
+    historical_calibration: dict[str, str] | None = None,
+    event_study: dict[str, str] | None = None,
+    factor_analysis: dict[str, str] | None = None,
+    meta_label: dict[str, str] | None = None,
 ) -> str:
     score_lines = "\n".join(f"{name}: {score}/10" for name, score in scores.items())
     verdict_lines = "\n".join(f"{name}: {value}" for name, value in verdict.items())
@@ -1496,6 +1854,10 @@ def format_engine_evidence(
         "SCENARIO MAP / UNCALIBRATED PAYOFF": payoff_distribution or {},
         "UNCONVENTIONAL / LESS-COMMON SIGNALS": unconventional_signals or {},
         "TRUE ASYMMETRY ASSESSMENT": asymmetry_assessment or {},
+        "V4 HISTORICAL CALIBRATION": historical_calibration or {},
+        "V4 EVENT STUDY": event_study or {},
+        "V4 FACTOR ANALYSIS": factor_analysis or {},
+        "V4 META LABEL": meta_label or {},
     }
     v3_lines: list[str] = []
     for title, values in v3_sections.items():
@@ -1515,7 +1877,7 @@ EVIDENCE FLAGS
 V2.1 DATA COMPLETION LAYER
 {chr(10).join(v21_lines).strip() or "No additional V2.1 data available."}
 
-V3 EDGE / ASYMMETRY LAYER
+V3/V4 EDGE, CALIBRATION, AND META-LABEL LAYER
 {chr(10).join(v3_lines).strip() or "No V3 edge diagnostics available."}"""
 
 
@@ -1696,6 +2058,10 @@ def load_cache(ticker: str) -> DDResult | None:
             "payoff_distribution",
             "unconventional_signals",
             "asymmetry_assessment",
+            "historical_calibration",
+            "event_study",
+            "factor_analysis",
+            "meta_label",
         ]:
             data.setdefault(key, {})
         return DDResult(**data)
@@ -1823,6 +2189,7 @@ Do not replace missing values with generic guesses.
 
 Use this deterministic evidence engine as the trading frame. Treat the V2.1 scores as discipline checks,
 not calibrated alpha. Treat the V3 edge/asymmetry layer as the only place where asymmetry can be discussed.
+Treat the V4 meta-label as the actionability overlay.
 Do not ignore it or replace it with generic company commentary.
 
 {engine_evidence}
@@ -1868,18 +2235,19 @@ Based on Steps 1-2: {step_1}
 
 {step_2}
 
-The deterministic evidence engine is the primary decision layer. Do not invent asymmetry if the V3
+The deterministic evidence engine is the primary decision layer. The V4 meta-label is the actionability overlay.
+Do not invent asymmetry if the V3
 True Asymmetry Status is NOT ESTABLISHED, UNPROVEN, UNFAVORABLE, or TACTICAL ONLY:
 {engine_evidence}
 
 Produce a decision-first trading dashboard:
 1. DECISION: Use the deterministic trade verdict exactly. Distinguish the verdict from action:
    for example, WAIT FOR PULLBACK can map to Action: HOLD and Bias: WATCHLIST.
-2. WHY NOW: one sentence. If no near-term edge, say so.
+2. WHY NOW: one sentence. If the V4 meta-label says AVOID or WATCH, say so.
 3. BULL CASE: 3 drivers, what goes right, and trigger to confirm. Do not invent probability.
 4. BEAR CASE: 3 risks, what breaks, and trigger to invalidate. Do not invent probability.
 5. ASYMMETRY: use the V3 True Asymmetry Status. If it is not established, say exactly why.
-6. TRADE CARD: horizon, top catalyst, invalidation trigger, key metric to monitor, confidence 1-10.
+6. TRADE CARD: include V4 meta-label, horizon, top catalyst, invalidation trigger, key metric to monitor, confidence 1-10.
 
 End with this exact block:
 TRADING_DECISION_CARD
@@ -1895,6 +2263,7 @@ Key Metric: [one sentence]
 Bull Probability: [use calibrated value only, otherwise Uncalibrated]
 Bear Probability: [use calibrated value only, otherwise Uncalibrated]
 Confidence: [1-10]
+Meta Label: [use V4 Meta Label exactly]
 
 Format: 450-650 words. No generic background. Do not output numeric bull/bear probabilities unless the deterministic evidence provides calibrated probabilities.
 """.strip()
@@ -1919,6 +2288,15 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         engine_scores,
     )
     trade_verdict = apply_true_asymmetry_guard(trade_verdict, asymmetry_assessment)
+    historical_calibration, event_study, factor_analysis, meta_label = build_v4_calibration_layer(
+        ticker,
+        market_data,
+        engine_scores,
+        trade_verdict,
+        v21_data,
+        unconventional_signals,
+        asymmetry_assessment,
+    )
     engine_evidence = format_engine_evidence(
         engine_scores,
         trade_verdict,
@@ -1928,6 +2306,10 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         payoff_distribution,
         unconventional_signals,
         asymmetry_assessment,
+        historical_calibration,
+        event_study,
+        factor_analysis,
+        meta_label,
     )
     if market_data.get("error"):
         st.warning(market_data["error"])
@@ -1980,12 +2362,14 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         v21_data,
         payoff_distribution,
         asymmetry_assessment,
+        meta_label,
         reason,
     )
     decision_card["Engine Verdict"] = trade_verdict["Verdict"]
     decision_card["Trade Type"] = trade_verdict["Trade Type"]
     decision_card["Action"] = trade_verdict["Action"]
-    decision_card["Bias"] = trade_verdict["Bias"]
+    decision_card["Bias"] = meta_label_bias(meta_label, trade_verdict)
+    decision_card["Meta Label"] = meta_label.get("Meta Label", "Not assessed")
     result = DDResult(
         ticker=ticker,
         company_name=extract_company_name(step_1) or market_data.get("name"),
@@ -2009,6 +2393,10 @@ def run_analysis(ticker: str, force_refresh: bool = False) -> DDResult:
         payoff_distribution=payoff_distribution,
         unconventional_signals=unconventional_signals,
         asymmetry_assessment=asymmetry_assessment,
+        historical_calibration=historical_calibration,
+        event_study=event_study,
+        factor_analysis=factor_analysis,
+        meta_label=meta_label,
     )
     save_cache(result)
     return result
@@ -2110,6 +2498,7 @@ def apply_deterministic_card_defaults(
     v21_data: dict[str, Any],
     payoff: dict[str, str],
     asymmetry: dict[str, str],
+    meta_label: dict[str, str],
     reason: str,
 ) -> dict[str, str]:
     updated = dict(card)
@@ -2120,7 +2509,7 @@ def apply_deterministic_card_defaults(
     key_metric = deterministic_key_metric(trends)
     defaults = {
         "Action": verdict.get("Action", updated.get("Action", "HOLD")),
-        "Bias": verdict.get("Bias", updated.get("Bias", "WATCHLIST")),
+        "Bias": meta_label_bias(meta_label, verdict),
         "Horizon": horizon,
         "Why Now": reason,
         "Top Catalyst": deterministic_top_catalyst(earnings, verdict),
@@ -2138,6 +2527,17 @@ def apply_deterministic_card_defaults(
         updated["Bear Probability"] = "Uncalibrated"
         updated["Confidence"] = deterministic_confidence(asymmetry, payoff)
     return updated
+
+
+def meta_label_bias(meta_label: dict[str, str], verdict: dict[str, str]) -> str:
+    label = meta_label.get("Meta Label", "")
+    if label == "TAKE":
+        return "LONG"
+    if label == "AVOID":
+        return "AVOID"
+    if label:
+        return "WATCHLIST"
+    return verdict.get("Bias", "WATCHLIST")
 
 
 def is_unspecified(value: str | None) -> bool:
@@ -2277,6 +2677,10 @@ def export_markdown(result: DDResult) -> str:
     payoff = markdown_dict(result.payoff_distribution)
     unconventional = markdown_dict(result.unconventional_signals)
     true_asymmetry = markdown_dict(result.asymmetry_assessment)
+    historical = markdown_dict(result.historical_calibration)
+    events = markdown_dict(result.event_study)
+    factors = markdown_dict(result.factor_analysis)
+    meta = markdown_dict(result.meta_label)
     company = f"\n**Company:** {result.company_name}" if result.company_name else ""
     return f"""# {APP_TITLE}
 
@@ -2317,6 +2721,22 @@ def export_markdown(result: DDResult) -> str:
 ## V3 True Asymmetry Assessment
 
 {true_asymmetry}
+
+## V4 Historical Calibration
+
+{historical}
+
+## V4 Event Study
+
+{events}
+
+## V4 Factor Analysis
+
+{factors}
+
+## V4 Meta Label
+
+{meta}
 
 ## Earnings Intelligence
 
@@ -2366,8 +2786,14 @@ def render_dashboard(result: DDResult) -> None:
     verdict_cols[1].metric("Action", verdict.get("Action", result.recommendation))
     verdict_cols[2].metric("Bias", verdict.get("Bias", "WATCHLIST"))
     verdict_cols[3].metric("Trade Type", verdict.get("Trade Type", "N/A"))
+    if result.meta_label:
+        meta_cols = st.columns([1.2, 1])
+        meta_cols[0].metric("Meta Label", result.meta_label.get("Meta Label", "N/A"))
+        meta_cols[1].metric("Meta Confidence", result.meta_label.get("Confidence", "N/A"))
     with st.container(border=True):
         st.markdown(f"**Why:** {verdict.get('Why', result.recommendation_reason)}")
+        if result.meta_label:
+            st.markdown(f"**Meta label reason:** {result.meta_label.get('Reason', 'Not assessed')}")
         st.markdown(f"**Confirm:** {verdict.get('Confirm', 'Not specified')}")
         st.markdown(f"**Invalidate:** {verdict.get('Invalidate', 'Not specified')}")
         st.markdown(f"**Discipline skew:** {verdict.get('Asymmetry', 'Not specified')}")
@@ -2389,6 +2815,10 @@ def render_dashboard(result: DDResult) -> None:
     render_info_grid("V3 Scenario Map", result.payoff_distribution)
     render_info_grid("V3 Unconventional Signals", result.unconventional_signals)
     render_info_grid("V3 True Asymmetry Assessment", result.asymmetry_assessment)
+    render_info_grid("V4 Historical Calibration", result.historical_calibration)
+    render_info_grid("V4 Event Study", result.event_study)
+    render_info_grid("V4 Factor Analysis", result.factor_analysis)
+    render_info_grid("V4 Meta Label", result.meta_label)
 
     st.subheader("Decision Card")
     card = result.decision_card

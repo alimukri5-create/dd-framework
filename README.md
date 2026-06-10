@@ -18,6 +18,7 @@ or avoid.
 - Bull/base/stress scenario map with unweighted magnitude ratio
 - SEC filing scan for shelf/offering overhang and recent 8-K activity
 - True-asymmetry gate that refuses to claim edge without expectations + payoff + non-consensus evidence
+- V4 calibration lab with historical analogs, event study, factor-adjusted return, and meta-label overlay
 - Three sequential GPT synthesis steps
 - Cached ticker reports with a cached-on timestamp
 - Dashboard scores from 1-10 for momentum, exhaustion, fundamental trend, valuation stretch, event risk,
@@ -51,6 +52,14 @@ The edge layer then asks whether true asymmetry can be established:
 - Is there any non-consensus signal from filings, insider activity, or less-common data?
 - Is the result calibrated or still heuristic?
 
+The V4 calibration layer adds empirical context:
+
+- Similar historical setup outcomes using 1M/3M return analogs
+- Forward 5D/20D/60D return medians and hit rates
+- Post-event reaction windows for SEC/earnings events
+- SPY/IWM adjusted move where enough trading history exists
+- Meta-label: TAKE, WATCH / WAIT FOR TRIGGER, TACTICAL WATCH, or AVOID
+
 OpenAI receives those computed facts and explains the trade setup, catalyst, invalidation trigger, and key metric.
 The model is synthesis, not the primary scoring engine.
 
@@ -66,6 +75,7 @@ The framework is built for quick trading decisions:
 - No market expectations baseline means no true asymmetry claim.
 - No calibrated probability-weighted payoff means no true asymmetry claim.
 - No non-consensus evidence means no edge claim.
+- No sample size means no model confidence.
 
 ## Setup
 
