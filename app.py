@@ -1066,7 +1066,10 @@ def build_historical_calibration(data: dict[str, Any], history: Any) -> dict[str
     if current_r1 is None or current_r3 is None:
         return {"Calibration Status": "Unavailable: current 1M/3M setup returns missing."}
 
+    raw_candidate_count = 0
     samples: list[dict[str, float]] = []
+    last_accepted_index: int | None = None
+    embargo_days = 21
     for index in range(63, len(close) - 60):
         r1 = historical_return(close, index, 21)
         r3 = historical_return(close, index, 63)
@@ -1074,20 +1077,29 @@ def build_historical_calibration(data: dict[str, Any], history: Any) -> dict[str
             continue
         if not is_similar_setup(r1, current_r1) or not is_similar_setup(r3, current_r3):
             continue
+        raw_candidate_count += 1
+        if last_accepted_index is not None and index - last_accepted_index < embargo_days:
+            continue
         row = {"r1": r1, "r3": r3}
         for horizon in [5, 20, 60]:
             row[f"fwd_{horizon}"] = forward_return(close, index, horizon)
         row["max_drawdown_20"] = max_drawdown_forward(close, index, 20)
         row["max_runup_20"] = max_runup_forward(close, index, 20)
         samples.append(row)
+        last_accepted_index = index
 
     calibration = {
         "Current Setup": f"1M {current_r1:,.1f}%, 3M {current_r3:,.1f}%",
-        "Analog Definition": "Same ticker history with similar 1M and 3M return profile.",
-        "Analog Sample Size": str(len(samples)),
+        "Analog Definition": (
+            "Same ticker history with similar 1M and 3M return profile, de-duplicated with a "
+            f"{embargo_days}-trading-day embargo to reduce overlapping-label bias."
+        ),
+        "Raw Analog Candidates": str(raw_candidate_count),
+        "Unique Analog Events": str(len(samples)),
+        "Embargo": f"{embargo_days} trading days",
     }
     if not samples:
-        calibration["Calibration Status"] = "Thin: no historical analogs found."
+        calibration["Calibration Status"] = "No usable de-duplicated analogs found."
         return calibration
 
     for horizon in [5, 20, 60]:
@@ -1101,7 +1113,12 @@ def build_historical_calibration(data: dict[str, Any], history: Any) -> dict[str
         calibration["20D Median Max Drawdown"] = format_signed_percent(median(drawdowns))
     if runups:
         calibration["20D Median Max Runup"] = format_signed_percent(median(runups))
-    calibration["Calibration Status"] = "Usable" if len(samples) >= 10 else "Thin sample: directional only."
+    if len(samples) >= 10:
+        calibration["Calibration Status"] = "Usable after overlap embargo."
+    elif len(samples) >= 5:
+        calibration["Calibration Status"] = "Thin sample after overlap embargo: directional only."
+    else:
+        calibration["Calibration Status"] = "Very thin sample after overlap embargo: do not treat as calibrated."
     return calibration
 
 
@@ -1253,6 +1270,7 @@ def build_factor_analysis(ticker: str, history: Any) -> dict[str, str]:
             "IWM Beta 126D": format_market_value(beta_iwm) if beta_iwm is not None else "N/A",
             "20D SPY-Adjusted Move": format_signed_percent(alpha_spy),
             "20D IWM-Adjusted Move": format_signed_percent(alpha_iwm),
+            "Beta Caveat": "126D beta is noisy on volatile/small-cap story stocks; treat adjusted move as heuristic.",
             "Factor Status": "Heuristic single-factor adjustment; not a full risk model.",
         }
     except Exception as exc:
@@ -1314,11 +1332,20 @@ def build_meta_label(
 
     fwd_20 = parse_percent_from_text(calibration.get("20D Forward Median"))
     hit_20 = parse_percent_from_text(calibration.get("20D Forward Hit Rate"))
+    unique_analogs = int_or_none(calibration.get("Unique Analog Events")) or 0
     alpha_iwm = parse_percent_from_text(factors.get("20D IWM-Adjusted Move"))
     if verdict.get("Action") == "PROCEED" and asymmetry.get("True Asymmetry Status") == "POTENTIALLY ASYMMETRIC":
         label = "TAKE"
         reasons.append("Verdict and true-asymmetry gate align.")
-    elif fwd_20 is not None and hit_20 is not None and fwd_20 > 0 and hit_20 >= 55 and scores.get("Dilution Risk", 5) < 8:
+    elif (
+        unique_analogs >= 5
+        and fwd_20 is not None
+        and hit_20 is not None
+        and fwd_20 > 0
+        and hit_20 >= 55
+        and scores.get("Dilution Risk", 5) < 8
+        and asymmetry.get("True Asymmetry Status") not in {"UNFAVORABLE", "NOT ESTABLISHED"}
+    ):
         label = "WATCH / WAIT FOR TRIGGER"
         reasons.append("Historical analogs are constructive, but deterministic gate is not fully open.")
     elif (
@@ -1345,7 +1372,7 @@ def build_meta_label(
 
 def meta_label_confidence(calibration: dict[str, str], events: dict[str, str], factors: dict[str, str]) -> str:
     points = 2
-    sample_size = int_or_none(calibration.get("Analog Sample Size")) or 0
+    sample_size = int_or_none(calibration.get("Unique Analog Events")) or 0
     if sample_size >= 20:
         points += 3
     elif sample_size >= 10:

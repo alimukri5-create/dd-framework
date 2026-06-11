@@ -54,7 +54,7 @@ The edge layer then asks whether true asymmetry can be established:
 
 The V4 calibration layer adds empirical context:
 
-- Similar historical setup outcomes using 1M/3M return analogs
+- Similar historical setup outcomes using 1M/3M return analogs, de-duplicated with a 21-trading-day embargo
 - Forward 5D/20D/60D return medians and hit rates
 - Post-event reaction windows for SEC/earnings events
 - SPY/IWM adjusted move where enough trading history exists
@@ -76,6 +76,7 @@ The framework is built for quick trading decisions:
 - No calibrated probability-weighted payoff means no true asymmetry claim.
 - No non-consensus evidence means no edge claim.
 - No sample size means no model confidence.
+- Overlapping analog windows are de-duplicated; raw windows are not treated as independent observations.
 
 ## Setup
 
