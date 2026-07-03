@@ -37,11 +37,11 @@ def render_result(result: ScanResult) -> None:
     )
     for signal in order_evidence(result.signals, result.verdict)[:6]:
         if signal.severity == "no-go":
-            st.error(signal.message, icon="X")
+            st.error(signal.message)
         elif signal.severity == "check":
-            st.warning(signal.message, icon="!")
+            st.warning(signal.message)
         else:
-            st.success(signal.message, icon="+")
+            st.success(signal.message)
     if result.cache_notes:
         st.caption("Cache: " + ", ".join(result.cache_notes))
 
