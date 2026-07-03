@@ -1,4 +1,4 @@
-"""Streamlit wrapper for Velocity Scanner v1."""
+﻿"""Streamlit wrapper for Velocity Scanner v1."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def render_result(result: ScanResult) -> None:
             <span style="color:{color}; font-weight:700;">{result.verdict}</span>
           </div>
           <div style="font-size:0.9rem; color:#444; margin-top:0.25rem;">
-            Confidence {result.confidence:.0%} · Regime {result.regime}
+            Confidence {result.confidence:.0%} | Regime {result.regime}
           </div>
         </div>
         """,
@@ -37,7 +37,7 @@ def render_result(result: ScanResult) -> None:
     )
     for signal in order_evidence(result.signals, result.verdict)[:6]:
         if signal.severity == "no-go":
-            st.error(signal.message, icon="✕")
+            st.error(signal.message, icon="X")
         elif signal.severity == "check":
             st.warning(signal.message, icon="!")
         else:
